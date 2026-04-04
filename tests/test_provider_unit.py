@@ -692,6 +692,11 @@ def test_meshcore_short_name_empty_when_too_short():
     assert _meshcore_short_name(None) == ""  # type: ignore[arg-type]
 
 
+def test_meshcore_short_name_exactly_four_chars():
+    """_meshcore_short_name with exactly four hex chars returns those four chars."""
+    assert _meshcore_short_name("abcd") == "abcd"
+
+
 # ---------------------------------------------------------------------------
 # _pubkey_prefix_to_node_id
 # ---------------------------------------------------------------------------
@@ -735,6 +740,9 @@ def test_meshcore_adv_type_to_role_none_for_unmapped():
     assert _meshcore_adv_type_to_role(99) is None
     assert _meshcore_adv_type_to_role(None) is None
     assert _meshcore_adv_type_to_role("1") is None
+    assert (
+        _meshcore_adv_type_to_role(2.0) is None
+    )  # float rejected; JSON numeric coercion guard
 
 
 # ---------------------------------------------------------------------------

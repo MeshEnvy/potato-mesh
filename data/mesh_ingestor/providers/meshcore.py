@@ -81,10 +81,10 @@ _DEFAULT_BAUDRATE: int = 115200
 
 # MeshCore ``ADV_TYPE_*`` (``AdvertDataHelpers.h``) → ``user.role`` for POST /api/nodes.
 _MESHCORE_ADV_TYPE_ROLE: dict[int, str] = {
-    1: "COMPANION",
-    2: "REPEATER",
-    3: "ROOM_SERVER",
-    4: "SENSOR",
+    1: "COMPANION",  # ADV_TYPE_CHAT
+    2: "REPEATER",  # ADV_TYPE_REPEATER
+    3: "ROOM_SERVER",  # ADV_TYPE_ROOM_SERVER
+    4: "SENSOR",  # ADV_TYPE_SENSOR
 }
 
 # ---------------------------------------------------------------------------
@@ -145,13 +145,14 @@ def _meshcore_short_name(public_key_hex: str | None) -> str:
         public_key_hex: Full public key as a hex string from the MeshCore API.
 
     Returns:
-        Four lowercase hex characters, or an empty string when the key is
-        missing or shorter than four hex digits.
+        Four lowercase hex characters (e.g. ``"aabb"``), or an empty string
+        when the key is missing or shorter than four hex characters.
     """
     if not public_key_hex or len(public_key_hex) < 4:
         return ""
     return public_key_hex[:4].lower()
-    
+
+
 def _meshcore_adv_type_to_role(adv_type: object) -> str | None:
     """Map MeshCore ``ADV_TYPE_*`` (contact ``type`` / self ``adv_type``) to ingest role.
 
@@ -161,12 +162,14 @@ def _meshcore_adv_type_to_role(adv_type: object) -> str | None:
 
     Parameters:
         adv_type: Raw type byte from meshcore_py (typically ``int`` 0–4).
+            Non-integer values (e.g. ``float``, ``None``) are rejected and
+            return ``None``.  Future firmware type codes not yet in the mapping
+            also return ``None`` until the table is updated.
 
     Returns:
         Uppercase role string, or ``None`` when the value is unknown or should
         not override the web default (``ADV_TYPE_NONE`` / unrecognised).
     """
-
     if not isinstance(adv_type, int):
         return None
     return _MESHCORE_ADV_TYPE_ROLE.get(adv_type)

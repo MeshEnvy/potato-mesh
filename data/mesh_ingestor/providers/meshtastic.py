@@ -24,6 +24,7 @@ from pubsub import pub
 from .. import config, daemon as _daemon, handlers, interfaces
 from ..connection import list_serial_candidates
 from ..provider import ConnectionCandidate
+from ..utils import _retry_dict_snapshot
 
 _MESHTASTIC_BLE_SERVICE_UUID = "6ba1b218-15a8-461f-9fa8-5dcae273eafd"
 """Meshtastic GATT service UUID used to filter BLE scan results."""
@@ -136,19 +137,29 @@ class MeshtasticProvider:
         return interfaces._extract_host_node_id(iface)
 
     def node_snapshot_items(self, iface: object) -> list[tuple[str, object]]:
+        """Return a stable snapshot of all known nodes from ``iface``.
+
+        Uses :func:`~data.mesh_ingestor.utils._retry_dict_snapshot` to
+        tolerate concurrent modifications from the Meshtastic background
+        thread.
+
+        Parameters:
+            iface: Live Meshtastic interface whose ``nodes`` dict to snapshot.
+
+        Returns:
+            List of ``(node_id, node_dict)`` tuples, or an empty list when
+            the snapshot fails after retries.
+        """
+
         nodes = getattr(iface, "nodes", {}) or {}
-        for _ in range(3):
-            try:
-                return list(nodes.items())
-            except RuntimeError as err:
-                if "dictionary changed size during iteration" not in str(err):
-                    raise
-                time.sleep(0)
-        config._debug_log(
-            "Skipping node snapshot due to concurrent modification",
-            context="meshtastic.snapshot",
-        )
-        return []
+        result = _retry_dict_snapshot(lambda: list(nodes.items()))
+        if result is None:
+            config._debug_log(
+                "Skipping node snapshot due to concurrent modification",
+                context="meshtastic.snapshot",
+            )
+            return []
+        return result
 
     def list_connection_candidates(
         self, *, ble_scan_timeout_secs: float
