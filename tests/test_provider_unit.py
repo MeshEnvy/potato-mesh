@@ -40,6 +40,7 @@ from data.mesh_ingestor.providers.meshcore import (  # noqa: E402 - path setup
     _make_event_handlers,
     _meshcore_adv_type_to_role,
     _meshcore_node_id,
+    _meshcore_short_name,
     _process_contact_update,
     _process_contacts,
     _process_self_info,
@@ -435,6 +436,7 @@ def test_meshcore_node_snapshot_items_with_contacts(monkeypatch):
     node_id, node_dict = items[0]
     assert node_id == "!aabbccdd"
     assert node_dict["user"]["longName"] == "Alice"
+    assert node_dict["user"]["shortName"] == "aabb"
     iface.close()
 
 
@@ -538,6 +540,23 @@ def test_meshcore_node_id_none_on_empty():
     assert _meshcore_node_id(None) is None  # type: ignore[arg-type]
 
 
+def test_meshcore_short_name_first_four_hex_digits():
+    """_meshcore_short_name returns the first four hex chars, lowercased."""
+    assert _meshcore_short_name("AABBccdd" + "00" * 28) == "aabb"
+
+
+def test_meshcore_short_name_empty_when_too_short():
+    """_meshcore_short_name returns '' when the key has fewer than four hex digits."""
+    assert _meshcore_short_name("") == ""
+    assert _meshcore_short_name("abc") == ""
+    assert _meshcore_short_name(None) == ""  # type: ignore[arg-type]
+
+
+def test_meshcore_short_name_exactly_four_chars():
+    """_meshcore_short_name with exactly four hex chars returns those four chars."""
+    assert _meshcore_short_name("abcd") == "abcd"
+
+
 # ---------------------------------------------------------------------------
 # _pubkey_prefix_to_node_id
 # ---------------------------------------------------------------------------
@@ -581,6 +600,9 @@ def test_meshcore_adv_type_to_role_none_for_unmapped():
     assert _meshcore_adv_type_to_role(99) is None
     assert _meshcore_adv_type_to_role(None) is None
     assert _meshcore_adv_type_to_role("1") is None
+    assert (
+        _meshcore_adv_type_to_role(2.0) is None
+    )  # float rejected; JSON numeric coercion guard
 
 
 # ---------------------------------------------------------------------------
@@ -598,7 +620,7 @@ def test_contact_to_node_dict_basic_fields():
     node = _contact_to_node_dict(contact)
     assert node["lastHeard"] == 1700000000
     assert node["user"]["longName"] == "Alice"
-    assert node["user"]["shortName"] == "Alic"
+    assert node["user"]["shortName"] == "aabb"
     assert node["user"]["publicKey"] == contact["public_key"]
     assert "role" not in node["user"]
 
@@ -655,7 +677,7 @@ def test_self_info_to_node_dict_basic_fields():
     self_info = {"name": "MyNode", "public_key": "bb" * 32}
     node = _self_info_to_node_dict(self_info)
     assert node["user"]["longName"] == "MyNode"
-    assert node["user"]["shortName"] == "MyNo"
+    assert node["user"]["shortName"] == "bbbb"
     assert node["user"]["publicKey"] == "bb" * 32
     assert isinstance(node["lastHeard"], int)
     assert "role" not in node["user"]
@@ -701,6 +723,7 @@ def test_interface_update_and_snapshot_contacts():
     node_id, node_dict = snapshot[0]
     assert node_id == "!aabbccdd"
     assert node_dict["user"]["longName"] == "Bob"
+    assert node_dict["user"]["shortName"] == "aabb"
 
 
 def test_interface_lookup_node_id_by_prefix():
