@@ -247,6 +247,19 @@ module PotatoMesh
         (ip.ipv4? || ip.ipv6?) && ip.to_i.zero?
       end
 
+      # Build an +http:+ URL for a TCP listen address (+Host:+ / +bind+ value and port).
+      # IPv6 literals are bracketed per RFC 3986.
+      #
+      # @param host [String] bind address, hostname, or IP literal.
+      # @param port [Integer] TCP port.
+      # @return [String] URL string such as +http://0.0.0.0:41447+ or +http://[::1]:8080+.
+      def http_listen_url(host, port)
+        host_str = host.to_s
+        literal = ipv6_literal?(host_str)
+        authority = literal ? "[#{literal}]:#{port}" : "#{host_str}:#{port}"
+        "http://#{authority}"
+      end
+
       # Choose the most appropriate local IP address for the instance domain.
       #
       # @return [String] selected IP address string.

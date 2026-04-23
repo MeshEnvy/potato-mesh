@@ -61,6 +61,59 @@ RSpec.describe PotatoMesh::Application do
     end
   end
 
+  describe ".http_listen_url" do
+    it "formats IPv4 bind addresses" do
+      expect(described_class.http_listen_url("0.0.0.0", 41_447)).to eq("http://0.0.0.0:41447")
+    end
+
+    it "brackets IPv6 literals" do
+      expect(described_class.http_listen_url("::1", 8080)).to eq("http://[::1]:8080")
+    end
+
+    it "passes hostnames through unchanged" do
+      expect(described_class.http_listen_url("localhost", 1)).to eq("http://localhost:1")
+    end
+  end
+
+  describe ".log_web_listen_urls" do
+    let(:io) { StringIO.new }
+    let(:app_logger) { Logger.new(io) }
+    let(:settings_double) { Struct.new(:bind, :port, :logger).new(bind, port, app_logger) }
+    let(:bind) { "0.0.0.0" }
+    let(:port) { 41_447 }
+
+    before do
+      allow(described_class).to receive(:settings).and_return(settings_double)
+    end
+
+    it "logs binding and LAN on one line when they differ" do
+      allow(described_class).to receive(:discover_local_ip_address).and_return("192.168.0.50")
+
+      described_class.log_web_listen_urls
+
+      expect(io.string).to include("web server: bound http://0.0.0.0:41447 (LAN http://192.168.0.50:41447)")
+    end
+
+    it "logs a single listen line when bind and LAN URLs match" do
+      allow(described_class).to receive(:discover_local_ip_address).and_return("127.0.0.1")
+      settings_double.bind = "127.0.0.1"
+
+      described_class.log_web_listen_urls
+
+      expect(io.string).to include("web server: listening on http://127.0.0.1:41447")
+      expect(io.string).not_to include("LAN ")
+    end
+
+    it "skips logging when the logger is nil" do
+      settings_double.logger = nil
+      allow(described_class).to receive(:discover_local_ip_address).and_return("10.0.0.1")
+
+      described_class.log_web_listen_urls
+
+      expect(io.string).to eq("")
+    end
+  end
+
   describe ".ip_address_candidates and .discover_local_ip_address with no interfaces" do
     it "returns an empty list when Socket.ip_address_list returns nothing" do
       allow(Socket).to receive(:ip_address_list).and_return([])

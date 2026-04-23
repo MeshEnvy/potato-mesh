@@ -66,6 +66,15 @@ require_relative "application/routes/root"
 
 module PotatoMesh
   class Application < Sinatra::Base
+    # Sinatra 4 enables Rack::Protection::HostAuthorization in development with a fixed
+    # allowlist. Dev tunnels (cloudflared, ngrok) send Host: *.trycloudflare.com etc., which
+    # otherwise yields 403 plain text "Host not permitted" (not from our JSON API errors).
+    DEVELOPMENT_TUNNEL_HOST_SUFFIXES = %w[
+      .trycloudflare.com
+      .ngrok-free.app
+      .ngrok.app
+      .ngrok.io
+    ].freeze
     extend App::Helpers
     extend App::Database
     extend App::Networking
@@ -139,7 +148,40 @@ module PotatoMesh
       port
     end
 
+    # Emit the configured bind URL and a likely LAN URL on stdout (after the HTTP server starts).
+    #
+    # @return [void]
+    def self.log_web_listen_urls
+      logger = settings.logger
+      return unless logger
+
+      bind_url = http_listen_url(settings.bind, settings.port)
+      lan_url = http_listen_url(discover_local_ip_address, settings.port)
+      if bind_url == lan_url
+        logger.info("web server: listening on #{bind_url}")
+      else
+        logger.info("web server: bound #{bind_url} (LAN #{lan_url})")
+      end
+    end
+
     configure do
+      set :host_authorization, lambda {
+        if development?
+          {
+            permitted_hosts: [
+              "localhost",
+              ".localhost",
+              ".test",
+              *DEVELOPMENT_TUNNEL_HOST_SUFFIXES,
+              IPAddr.new("0.0.0.0/0"),
+              IPAddr.new("::/0"),
+            ],
+          }
+        else
+          {}
+        end
+      }
+
       set :public_folder, File.expand_path("../../public", __dir__)
       set :views, File.expand_path("../../views", __dir__)
       set :federation_thread, nil
@@ -192,6 +234,8 @@ module PotatoMesh
           reason: "configuration",
         )
       end
+
+      on_start { PotatoMesh::Application.log_web_listen_urls }
     end
   end
 end
