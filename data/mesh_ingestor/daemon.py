@@ -24,8 +24,8 @@ import time
 
 from pubsub import pub
 
-from . import config, connection_scan, handlers, ingestors, interfaces
-from .provider import Provider
+from . import config, connection_scan, handlers, ingestors, interfaces, queue
+from .mesh_protocol import MeshProtocol
 from .utils import _retry_dict_snapshot
 
 _RECEIVE_TOPICS = (
@@ -245,7 +245,7 @@ def _connected_state(candidate) -> bool | None:
 class _DaemonState:
     """All mutable state for the :func:`main` daemon loop."""
 
-    provider: Provider
+    provider: MeshProtocol
     stop: threading.Event
     configured_port: str | None
     inactivity_reconnect_secs: float
@@ -264,6 +264,7 @@ class _DaemonState:
     last_inactivity_reconnect: float | None = None
     ingestor_announcement_sent: bool = False
     announced_target: bool = False
+    last_self_node_report: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +310,7 @@ def _try_connect(state: _DaemonState) -> bool:
         ingestors.set_ingestor_node_id(handlers.host_node_id())
         state.retry_delay = max(0.0, config._RECONNECT_INITIAL_DELAY_SECS)
         state.initial_snapshot_sent = False
+        state.last_self_node_report = None
         if not state.announced_target and state.resolved_target:
             config._debug_log(
                 "Using mesh interface",
@@ -387,6 +389,7 @@ def _check_energy_saving(state: _DaemonState) -> bool:
     state.iface = None
     state.announced_target = False
     state.initial_snapshot_sent = False
+    state.last_self_node_report = None
     state.energy_session_deadline = None
     _energy_sleep(state, reason)
     return True
@@ -485,31 +488,89 @@ def _check_inactivity_reconnect(state: _DaemonState) -> bool:
     ):
         return False
 
-    if (
-        state.last_inactivity_reconnect is not None
-        and now - state.last_inactivity_reconnect < state.inactivity_reconnect_secs
-    ):
-        return False
+    if state.last_inactivity_reconnect is not None:
+        # For explicit disconnects use the shorter max-reconnect-delay window
+        # so the daemon reconnects promptly without thrashing.  For inactivity-
+        # only triggers retain the full inactivity window as the throttle.
+        throttle_secs = (
+            config._RECONNECT_MAX_DELAY_SECS
+            if believed_disconnected
+            else state.inactivity_reconnect_secs
+        )
+        if now - state.last_inactivity_reconnect < throttle_secs:
+            return False
 
     reason = (
         "disconnected"
         if believed_disconnected
         else f"no data for {inactivity_elapsed:.0f}s"
     )
+    # Uses the module-level global STATE — acceptable because there is only
+    # one queue in production, and in tests this is purely informational.
+    queue_depth = len(queue.STATE.queue)
     config._debug_log(
         "Mesh interface inactivity detected",
         context="daemon.interface",
         severity="warn",
         reason=reason,
+        queue_depth=queue_depth,
     )
     state.last_inactivity_reconnect = now
     _close_interface(state.iface)
     state.iface = None
     state.announced_target = False
     state.initial_snapshot_sent = False
+    state.last_self_node_report = None
     state.energy_session_deadline = None
     state.iface_connected_at = None
     return True
+
+
+# ---------------------------------------------------------------------------
+# Periodic self-node report helper
+# ---------------------------------------------------------------------------
+
+
+def _try_send_self_node(state: _DaemonState) -> None:
+    """Re-upsert the host self-node when the provider supports it.
+
+    Called once immediately after the initial snapshot and then at most once
+    per :data:`~data.mesh_ingestor.config._SELF_NODE_REPORT_INTERVAL_SECS`.
+    This ensures the self-node's protocol and radio metadata are refreshed
+    even when the ingestor heartbeat races ahead of the first SELF_INFO event
+    (meshcore) or when the protocol never sends periodic NODEINFO for itself.
+
+    Parameters:
+        state: Current daemon loop state.
+
+    Returns:
+        ``None``.  Errors are logged and suppressed so a single failure does
+        not break the main loop.
+    """
+    self_node_fn = getattr(state.provider, "self_node_item", None)
+    if not callable(self_node_fn):
+        return
+    try:
+        item = self_node_fn(state.iface)
+        if item is None:
+            return
+        node_id, node = item
+        handlers.upsert_node(node_id, node)
+        state.last_self_node_report = time.monotonic()
+        config._debug_log(
+            "Sent periodic self-node report",
+            context="daemon.self_node",
+            severity="info",
+            node_id=node_id,
+        )
+    except Exception as exc:
+        config._debug_log(
+            "Self-node re-report failed",
+            context="daemon.self_node",
+            severity="warn",
+            error_class=exc.__class__.__name__,
+            error_message=str(exc),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +601,15 @@ def _loop_iteration(state: _DaemonState) -> bool:
     state.ingestor_announcement_sent = _process_ingestor_heartbeat(
         state.iface, ingestor_announcement_sent=state.ingestor_announcement_sent
     )
+    # Periodically re-upsert the host self-node so that its protocol and radio
+    # metadata are corrected after the ingestor heartbeat is registered, and
+    # kept fresh for protocols (e.g. meshcore) that only emit SELF_INFO once.
+    _now = time.monotonic()
+    if state.initial_snapshot_sent and (
+        state.last_self_node_report is None
+        or _now - state.last_self_node_report >= config._SELF_NODE_REPORT_INTERVAL_SECS
+    ):
+        _try_send_self_node(state)
     state.retry_delay = max(0.0, config._RECONNECT_INITIAL_DELAY_SECS)
     return False
 
@@ -549,16 +619,16 @@ def _loop_iteration(state: _DaemonState) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def main(*, provider: Provider | None = None) -> None:
+def main(*, provider: MeshProtocol | None = None) -> None:
     """Run the mesh ingestion daemon until interrupted."""
 
     if provider is None:
-        if config.PROVIDER == "meshcore":
-            from .providers.meshcore import MeshcoreProvider
+        if config.PROTOCOL == "meshcore":
+            from .protocols.meshcore import MeshcoreProvider
 
             provider = MeshcoreProvider()
         else:
-            from .providers.meshtastic import MeshtasticProvider
+            from .protocols.meshtastic import MeshtasticProvider
 
             provider = MeshtasticProvider()
 
@@ -570,6 +640,17 @@ def main(*, provider: Provider | None = None) -> None:
             severity="info",
             topics=subscribed,
         )
+
+    if not config.INSTANCES and not config.INSTANCE:
+        config._debug_log(
+            "No INSTANCE_DOMAIN configured — cannot forward data; exiting",
+            context="daemon.main",
+            severity="error",
+            always=True,
+        )
+        return
+
+    queue._start_queue_drainer(queue.STATE)
 
     if connection_scan.connection_is_ask(config.CONNECTION):
         config.CONNECTION = connection_scan.scan_connection(provider)
@@ -609,11 +690,12 @@ def main(*, provider: Provider | None = None) -> None:
         signal.signal(signal.SIGINT, handle_sigint)
         signal.signal(signal.SIGTERM, handle_sigterm)
 
+    instance_label = ", ".join(inst for inst, _ in config.INSTANCES)
     config._debug_log(
         "Mesh daemon starting",
         context="daemon.main",
         severity="info",
-        target=config.INSTANCE or "(no INSTANCE_DOMAIN configured)",
+        target=instance_label,
         port=config.CONNECTION or "auto",
         channel=config.CHANNEL_INDEX,
     )
@@ -647,6 +729,7 @@ __all__ = [
     "_process_ingestor_heartbeat",
     "_subscribe_receive_topics",
     "_try_connect",
+    "_try_send_self_node",
     "_try_send_snapshot",
     "main",
 ]

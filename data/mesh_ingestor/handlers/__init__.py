@@ -26,7 +26,7 @@ This package is organised into focused submodules:
 - :mod:`.generic` — packet dispatcher, node upsert, and the main receive callback
 
 All public names from the original flat ``handlers`` module are re-exported
-here so existing callers (e.g. ``daemon.py``, ``providers/``) require no
+here so existing callers (e.g. ``daemon.py``, ``protocols/``) require no
 changes.
 """
 
@@ -34,12 +34,16 @@ from __future__ import annotations
 
 from .. import queue as _queue
 from ._state import (
+    _mark_packet_seen,
     host_node_id,
     last_packet_monotonic,
     register_host_node_id,
 )
 from .generic import (
+    _coerce_emoji_codepoint,
     _is_encrypted_flag,
+    _is_likely_reaction,
+    _is_reaction_placeholder_text,
     _portnum_candidates,
     on_receive,
     store_packet_dict,
@@ -78,7 +82,11 @@ __all__ = [
     "_VALID_TELEMETRY_TYPES",
     "_apply_radio_metadata",
     "_apply_radio_metadata_to_nodes",
+    "_coerce_emoji_codepoint",
     "_is_encrypted_flag",
+    "_is_likely_reaction",
+    "_is_reaction_placeholder_text",
+    "_mark_packet_seen",
     "_normalize_trace_hops",
     "_portnum_candidates",
     "_queue_post_json",

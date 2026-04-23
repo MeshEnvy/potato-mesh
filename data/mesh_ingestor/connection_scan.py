@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 from typing import IO, TextIO
 
-from .provider import Provider
+from .mesh_protocol import MeshProtocol
 
 _DEFAULT_BLE_SCAN_SECS = 8.0
 """Default BLE scan duration for ``CONNECTION=ask`` when env is unset."""
@@ -61,7 +61,7 @@ def _prompt_manual_target(stdin: TextIO, stdout: TextIO) -> str:
 
 
 def resolve_connection_ask(
-    provider: Provider,
+    provider: MeshProtocol,
     *,
     stdin: IO[str],
     stdout: IO[str],
@@ -126,7 +126,7 @@ def resolve_connection_ask(
 
 
 def scan_connection(
-    provider: Provider,
+    provider: MeshProtocol,
     *,
     stdin: IO[str] | None = None,
     stdout: IO[str] | None = None,

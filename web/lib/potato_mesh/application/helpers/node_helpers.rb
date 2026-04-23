@@ -66,6 +66,66 @@ module PotatoMesh
         trimmed.start_with?("!") ? trimmed : "!#{trimmed}"
       end
 
+      # Broad emoji regex covering the most common Unicode emoji blocks:
+      # Supplementary Multilingual Plane emoji (U+1F000–U+1FFFF), Miscellaneous
+      # Symbols and Dingbats (U+2600–U+27BF), and Miscellaneous Symbols and
+      # Arrows (U+2B00–U+2BFF).
+      #
+      # Matching is intentionally single-codepoint: callers iterate grapheme
+      # clusters first and then test each cluster against this pattern, so
+      # multi-codepoint emoji (country flags like 🇩🇪 = 🇩 + 🇪, ZWJ family
+      # sequences like 👨‍👩‍👧, skin-tone modifiers like 👍🏽, the rainbow flag
+      # 🏳️‍🌈) come through intact instead of being shredded into their
+      # component codepoints.
+      #
+      # @type [Regexp]
+      MESHCORE_COMPANION_EMOJI_PATTERN = /[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}]/u
+
+      # Derive a display short name for a MeshCore COMPANION node from its long
+      # name. The ingestor stores a raw 2-byte short name; this method produces a
+      # richer, human-readable variant for the API layer without touching the DB.
+      #
+      # Algorithm (applied in priority order):
+      # 1. If the long name contains an emoji grapheme cluster (anchored by
+      #    +MESHCORE_COMPANION_EMOJI_PATTERN+), use that whole cluster in a
+      #    4-column display slot: ``" E "`` (one leading space, emoji, one
+      #    trailing space). Emoji are rendered double-width in monospace fonts,
+      #    so one leading space keeps the badge at four visual columns.
+      #    Iterating grapheme clusters (rather than raw codepoints) preserves
+      #    multi-codepoint sequences such as country flags 🇩🇪, ZWJ families
+      #    👨‍👩‍👧, and skin-tone-modified thumbs 👍🏽.
+      # 2. If the long name contains two or more whitespace-separated words,
+      #    use the capitalised first letters of the first two words: ``" XY "``.
+      # 3. Return +nil+ — single-word names fall back to the raw short name
+      #    stored in the database (typically the first two bytes of the node
+      #    ID). A single initial looked poor and carried no more information
+      #    than the raw value.
+      #
+      # @param long_name [String, nil] long name stored on the node.
+      # @return [String, nil] derived display short name or +nil+.
+      def meshcore_companion_display_short_name(long_name)
+        name = string_or_nil(long_name)
+        return nil unless name
+
+        emoji_cluster = name.each_grapheme_cluster.find do |cluster|
+          cluster.match?(MESHCORE_COMPANION_EMOJI_PATTERN)
+        end
+        # Wide emoji occupies two display columns, so use one leading space and
+        # one trailing space to stay within the four-column badge width.
+        return " #{emoji_cluster} " if emoji_cluster
+
+        words = name.strip.split(/\s+/).reject(&:empty?)
+        return nil if words.empty?
+
+        if words.length >= 2
+          first = words[0][0]&.upcase
+          second = words[1][0]&.upcase
+          return " #{first}#{second} " if first && second
+        end
+
+        nil
+      end
+
       # Recursively coerce hash keys to strings and normalise nested arrays.
       #
       # @param value [Object] JSON compatible value.

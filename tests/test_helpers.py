@@ -41,16 +41,6 @@ def reset_state(monkeypatch):
     importlib.reload(config)
 
 
-def test_config_module_port_aliases(monkeypatch):
-    """Ensure the config module keeps CONNECTION and PORT in sync."""
-
-    reloaded = importlib.reload(config)
-    monkeypatch.setattr(reloaded, "CONNECTION", "dev-tty", raising=False)
-    reloaded.PORT = "new-port"
-    assert reloaded.CONNECTION == "new-port"
-    assert reloaded.PORT == "new-port"
-
-
 def test_queue_stringification_and_ordering():
     """Exercise queue payload formatting and priority ordering."""
 
@@ -237,7 +227,7 @@ def test_region_frequency_and_resolution_helpers():
     assert freq == "915MHz"
 
     freq = interfaces._region_frequency(LoraMessage(2))
-    assert freq == "US"
+    assert freq == 902  # "US" is in the region lookup table → base 902 MHz
 
     class StringRegionMessage:
         def __init__(self, region):

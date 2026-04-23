@@ -70,6 +70,7 @@ _CONFIG_ATTRS = {
     "CHANNEL_INDEX",
     "DEBUG",
     "INSTANCE",
+    "INSTANCES",
     "API_TOKEN",
     "ALLOWED_CHANNELS",
     "HIDDEN_CHANNELS",
@@ -81,9 +82,6 @@ _CONFIG_ATTRS = {
     "_INGESTOR_HEARTBEAT_SECS",
     "_debug_log",
 }
-
-# Legacy export maintained for backwards compatibility.
-_CONFIG_ATTRS.add("PORT")
 
 _INTERFACE_ATTRS = {"BLEInterface", "SerialInterface", "TCPInterface"}
 

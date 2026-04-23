@@ -30,6 +30,7 @@ if str(REPO_ROOT) not in sys.path:
 import data.mesh_ingestor.config as config
 import data.mesh_ingestor.handlers as handlers
 import data.mesh_ingestor.handlers._state as _state_mod
+import data.mesh_ingestor.handlers.generic as generic_mod
 import data.mesh_ingestor.handlers.ignored as ignored_mod
 import data.mesh_ingestor.handlers.telemetry as telemetry_mod
 
@@ -39,10 +40,12 @@ def reset_handler_state():
     """Reset global handler state between tests."""
     _state_mod._host_node_id = None
     _state_mod._host_telemetry_last_rx = None
+    _state_mod._host_nodeinfo_last_seen = None
     _state_mod._last_packet_monotonic = None
     yield
     _state_mod._host_node_id = None
     _state_mod._host_telemetry_last_rx = None
+    _state_mod._host_nodeinfo_last_seen = None
     _state_mod._last_packet_monotonic = None
 
 
@@ -75,6 +78,12 @@ class TestHostNodeId:
         handlers.register_host_node_id("!aabbccdd")
         assert _state_mod._host_telemetry_last_rx is None
 
+    def test_register_resets_nodeinfo_window(self):
+        """Registering a new host ID resets the NODEINFO suppression window."""
+        _state_mod._host_nodeinfo_last_seen = 12345.0
+        handlers.register_host_node_id("!aabbccdd")
+        assert _state_mod._host_nodeinfo_last_seen is None
+
     def test_register_canonicalises_numeric(self):
         """Numeric node ID is converted to !xxxxxxxx form."""
         handlers.register_host_node_id(0xAABBCCDD)
@@ -99,6 +108,13 @@ class TestLastPacketMonotonic:
         ts = handlers.last_packet_monotonic()
         assert ts is not None
         assert isinstance(ts, float)
+
+    def test_mark_packet_seen_exported_from_handlers(self):
+        """handlers._mark_packet_seen must be accessible via the package."""
+        assert callable(handlers._mark_packet_seen)
+        handlers._mark_packet_seen()
+        ts = handlers.last_packet_monotonic()
+        assert ts is not None
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +159,51 @@ class TestHostTelemetrySuppressed:
         suppressed, mins = _state_mod._host_telemetry_suppressed(now)
         assert suppressed is True
         assert mins == 1
+
+
+# ---------------------------------------------------------------------------
+# _state: _host_nodeinfo_suppressed / _mark_host_nodeinfo_seen
+# ---------------------------------------------------------------------------
+
+
+class TestHostNodeinfoSuppressed:
+    """Tests for host NODEINFO suppression logic."""
+
+    def test_not_suppressed_when_no_previous(self):
+        """Not suppressed when no previous NODEINFO timestamp is set."""
+        assert _state_mod._host_nodeinfo_suppressed(time.monotonic()) is False
+
+    def test_suppressed_within_interval(self):
+        """Suppressed when within the suppression window."""
+        now = time.monotonic()
+        _state_mod._host_nodeinfo_last_seen = now - 10.0  # 10 seconds ago
+        assert _state_mod._host_nodeinfo_suppressed(now) is True
+
+    def test_not_suppressed_after_interval(self):
+        """Not suppressed after the full interval has elapsed."""
+        now = time.monotonic()
+        _state_mod._host_nodeinfo_last_seen = (
+            now - _state_mod._HOST_NODEINFO_INTERVAL_SECS - 1.0
+        )
+        assert _state_mod._host_nodeinfo_suppressed(now) is False
+
+    def test_mark_updates_timestamp(self):
+        """_mark_host_nodeinfo_seen stores the provided timestamp."""
+        now = time.monotonic()
+        _state_mod._mark_host_nodeinfo_seen(now)
+        assert _state_mod._host_nodeinfo_last_seen == now
+
+    def test_suppressed_after_mark(self):
+        """Immediately after marking, a second call is suppressed."""
+        now = time.monotonic()
+        _state_mod._mark_host_nodeinfo_seen(now)
+        assert _state_mod._host_nodeinfo_suppressed(now + 1.0) is True
+
+    def test_not_suppressed_after_mark_and_full_interval(self):
+        """After a full interval has elapsed, suppression lifts."""
+        long_ago = time.monotonic() - _state_mod._HOST_NODEINFO_INTERVAL_SECS - 5.0
+        _state_mod._mark_host_nodeinfo_seen(long_ago)
+        assert _state_mod._host_nodeinfo_suppressed(time.monotonic()) is False
 
 
 # ---------------------------------------------------------------------------
@@ -657,6 +718,91 @@ class TestStoreNodeinfoPacket:
             q._queue_post_json = original
         assert sent == []
 
+    def test_host_nodeinfo_not_suppressed_on_first_call(self):
+        """First NODEINFO from the host node is always forwarded."""
+        import data.mesh_ingestor.queue as q
+
+        handlers.register_host_node_id("!aabbccdd")
+        sent = []
+        original = q._queue_post_json
+        q._queue_post_json = lambda path, payload, *, priority, **kw: sent.append(path)
+        try:
+            handlers.store_nodeinfo_packet(
+                {"id": 1, "rxTime": 100, "fromId": "!aabbccdd"},
+                {"user": {"id": "!aabbccdd", "shortName": "AB", "longName": "Alpha"}},
+            )
+        finally:
+            q._queue_post_json = original
+        assert "/api/nodes" in sent
+
+    def test_host_nodeinfo_suppressed_within_window(self):
+        """Second NODEINFO from the host within the throttle window is dropped."""
+        import data.mesh_ingestor.queue as q
+
+        handlers.register_host_node_id("!aabbccdd")
+        # Simulate a recent upsert so the window is active.
+        _state_mod._mark_host_nodeinfo_seen(time.monotonic())
+
+        sent = []
+        original = q._queue_post_json
+        q._queue_post_json = lambda path, payload, *, priority, **kw: sent.append(path)
+        try:
+            handlers.store_nodeinfo_packet(
+                {"id": 2, "rxTime": 200, "fromId": "!aabbccdd"},
+                {"user": {"id": "!aabbccdd", "shortName": "AB", "longName": "Alpha"}},
+            )
+        finally:
+            q._queue_post_json = original
+        assert sent == []
+
+    def test_host_nodeinfo_allowed_after_window_expires(self):
+        """NODEINFO from the host is forwarded after the throttle window expires."""
+        import data.mesh_ingestor.queue as q
+
+        handlers.register_host_node_id("!aabbccdd")
+        # Place last-seen far in the past so the window has expired.
+        _state_mod._host_nodeinfo_last_seen = (
+            time.monotonic() - _state_mod._HOST_NODEINFO_INTERVAL_SECS - 10.0
+        )
+
+        sent = []
+        original = q._queue_post_json
+        q._queue_post_json = lambda path, payload, *, priority, **kw: sent.append(path)
+        try:
+            handlers.store_nodeinfo_packet(
+                {"id": 3, "rxTime": 300, "fromId": "!aabbccdd"},
+                {"user": {"id": "!aabbccdd", "shortName": "AB", "longName": "Alpha"}},
+            )
+        finally:
+            q._queue_post_json = original
+        assert "/api/nodes" in sent
+
+    def test_non_host_nodeinfo_never_suppressed(self):
+        """NODEINFO from a non-host node is never throttled."""
+        import data.mesh_ingestor.queue as q
+
+        handlers.register_host_node_id("!aabbccdd")
+        # Mark the host as recently seen to activate the throttle.
+        _state_mod._mark_host_nodeinfo_seen(time.monotonic())
+
+        sent = []
+        original = q._queue_post_json
+        q._queue_post_json = lambda path, payload, *, priority, **kw: sent.append(path)
+        try:
+            handlers.store_nodeinfo_packet(
+                {"id": 4, "rxTime": 400, "fromId": "!11223344"},
+                {
+                    "user": {
+                        "id": "!11223344",
+                        "shortName": "CD",
+                        "longName": "Charlie Delta",
+                    }
+                },
+            )
+        finally:
+            q._queue_post_json = original
+        assert "/api/nodes" in sent
+
 
 # ---------------------------------------------------------------------------
 # store_neighborinfo_packet
@@ -746,3 +892,197 @@ class TestStoreRouterHeartbeatPacket:
         finally:
             q._queue_post_json = original
         assert sent == []
+
+
+# ---------------------------------------------------------------------------
+# _coerce_emoji_codepoint
+# ---------------------------------------------------------------------------
+
+
+class TestCoerceEmojiCodepoint:
+    """Tests for :func:`_coerce_emoji_codepoint`."""
+
+    def test_none_returns_none(self):
+        """``None`` input yields ``None``."""
+        assert generic_mod._coerce_emoji_codepoint(None) is None
+
+    def test_int_codepoint_above_127(self):
+        """Integer codepoint above 127 is converted to the character."""
+        assert generic_mod._coerce_emoji_codepoint(128077) == "\U0001f44d"
+
+    def test_string_codepoint_above_127(self):
+        """Digit string representing a codepoint above 127 is converted."""
+        assert generic_mod._coerce_emoji_codepoint("128077") == "\U0001f44d"
+
+    def test_small_int_preserved_as_string(self):
+        """Small integer (≤ 127) is kept as its string representation."""
+        assert generic_mod._coerce_emoji_codepoint(1) == "1"
+
+    def test_small_string_digit_preserved(self):
+        """Digit string ≤ 127 is kept as-is (slot marker)."""
+        assert generic_mod._coerce_emoji_codepoint("1") == "1"
+
+    def test_emoji_string_passthrough(self):
+        """An already-resolved emoji character passes through."""
+        assert generic_mod._coerce_emoji_codepoint("\U0001f44d") == "\U0001f44d"
+
+    def test_whitespace_only_returns_none(self):
+        """Whitespace-only string yields ``None``."""
+        assert generic_mod._coerce_emoji_codepoint("   ") is None
+
+    def test_empty_string_returns_none(self):
+        """Empty string yields ``None``."""
+        assert generic_mod._coerce_emoji_codepoint("") is None
+
+    def test_float_codepoint_above_127(self):
+        """Float codepoint above 127 is truncated and converted."""
+        assert generic_mod._coerce_emoji_codepoint(128077.0) == "\U0001f44d"
+
+    def test_invalid_codepoint_returns_none(self):
+        """Out-of-range numeric codepoint returns ``None`` rather than the
+        decimal form (which would render as garbage in the chat log)."""
+        assert generic_mod._coerce_emoji_codepoint(0x7FFFFFFF) is None
+
+    def test_invalid_string_codepoint_returns_none(self):
+        """Out-of-range numeric string also returns ``None``."""
+        assert generic_mod._coerce_emoji_codepoint(str(0x7FFFFFFF)) is None
+
+
+# ---------------------------------------------------------------------------
+# _is_reaction_placeholder_text
+# ---------------------------------------------------------------------------
+
+
+class TestIsReactionPlaceholderText:
+    """Tests for :func:`_is_reaction_placeholder_text`."""
+
+    def test_none_is_placeholder(self):
+        """``None`` is a placeholder."""
+        assert generic_mod._is_reaction_placeholder_text(None) is True
+
+    def test_empty_is_placeholder(self):
+        """Empty string is a placeholder."""
+        assert generic_mod._is_reaction_placeholder_text("") is True
+
+    def test_whitespace_is_placeholder(self):
+        """Whitespace-only string is a placeholder."""
+        assert generic_mod._is_reaction_placeholder_text("   ") is True
+
+    def test_digit_slot_marker(self):
+        """Digit strings like '1' and '3' are placeholders."""
+        assert generic_mod._is_reaction_placeholder_text("1") is True
+        assert generic_mod._is_reaction_placeholder_text("3") is True
+
+    def test_bare_emoji_is_placeholder(self):
+        """A single emoji character is a placeholder."""
+        assert generic_mod._is_reaction_placeholder_text("\U0001f44d") is True
+
+    def test_substantial_text_is_not_placeholder(self):
+        """Prose text is not a placeholder."""
+        assert generic_mod._is_reaction_placeholder_text("Hello world") is False
+
+    def test_text_with_emoji_is_not_placeholder(self):
+        """Text containing both words and emoji is not a placeholder."""
+        assert (
+            generic_mod._is_reaction_placeholder_text("Great job! \U0001f44d") is False
+        )
+
+    def test_short_ascii_word_is_not_placeholder(self):
+        """A short ASCII word is not a placeholder."""
+        assert generic_mod._is_reaction_placeholder_text("hi") is False
+
+
+# ---------------------------------------------------------------------------
+# _is_likely_reaction
+# ---------------------------------------------------------------------------
+
+
+class TestIsLikelyReaction:
+    """Tests for :func:`_is_likely_reaction`."""
+
+    def test_reaction_app_portnum_string(self):
+        """Explicit REACTION_APP portnum is always a reaction."""
+        assert (
+            generic_mod._is_likely_reaction(
+                "REACTION_APP", None, 123, "\U0001f44d", None
+            )
+            is True
+        )
+
+    def test_reply_id_emoji_no_text(self):
+        """reply_id + emoji + no text is a reaction."""
+        assert (
+            generic_mod._is_likely_reaction(
+                "TEXT_MESSAGE_APP", 1, 123, "\U0001f44d", None
+            )
+            is True
+        )
+
+    def test_reply_id_emoji_digit_text(self):
+        """reply_id + emoji + digit count text is a reaction."""
+        assert (
+            generic_mod._is_likely_reaction(
+                "TEXT_MESSAGE_APP", 1, 123, "\U0001f44d", "3"
+            )
+            is True
+        )
+
+    def test_reply_id_emoji_substantial_text_not_reaction(self):
+        """reply_id + emoji + substantial text is NOT a reaction."""
+        assert (
+            generic_mod._is_likely_reaction(
+                "TEXT_MESSAGE_APP", 1, 123, "\U0001f44d", "Great job!"
+            )
+            is False
+        )
+
+    def test_no_emoji_not_reaction(self):
+        """Missing emoji means not a reaction (even with reply_id)."""
+        assert (
+            generic_mod._is_likely_reaction("TEXT_MESSAGE_APP", 1, 123, None, None)
+            is False
+        )
+
+    def test_no_reply_id_not_reaction(self):
+        """Missing reply_id means not a reaction (non-REACTION_APP portnum)."""
+        assert (
+            generic_mod._is_likely_reaction(
+                "TEXT_MESSAGE_APP", 1, None, "\U0001f44d", None
+            )
+            is False
+        )
+
+    def test_portnum_int_matches_reaction_candidate(self, monkeypatch):
+        """An unknown portnum string is still classified as a reaction when
+        ``portnum_int`` matches one of the firmware-resolved REACTION_APP
+        candidates.  Different Meshtastic firmware versions assign different
+        integer values to the REACTION_APP enum, so the integer fallback is
+        the authoritative path."""
+        monkeypatch.setattr(generic_mod, "_portnum_candidates", lambda name: {77})
+        assert (
+            generic_mod._is_likely_reaction("UNKNOWN_PORT", 77, None, None, None)
+            is True
+        )
+
+
+# ---------------------------------------------------------------------------
+# _coerce_emoji_codepoint — string conversion failure path
+# ---------------------------------------------------------------------------
+
+
+class TestCoerceEmojiStringFailure:
+    """Cover the ``except Exception`` branch in :func:`_coerce_emoji_codepoint`.
+
+    The string-conversion ``try`` is defensive against pathological values
+    (objects whose ``__str__`` raises).  We exercise it directly so the
+    fallback ``return None`` line is covered.
+    """
+
+    def test_object_str_raises(self):
+        """A value whose ``__str__`` raises yields ``None``."""
+
+        class Boom:
+            def __str__(self):  # noqa: D401 - pytest-style helper
+                raise RuntimeError("boom")
+
+        assert generic_mod._coerce_emoji_codepoint(Boom()) is None

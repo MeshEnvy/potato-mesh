@@ -96,45 +96,111 @@ class TestParseHiddenChannels:
 # ---------------------------------------------------------------------------
 
 
+class TestResolveInstanceDomains:
+    """Tests for :func:`config._resolve_instance_domains`."""
+
+    def test_single_domain(self, monkeypatch):
+        """Single domain produces one-element tuple."""
+        monkeypatch.setenv("INSTANCE_DOMAIN", "foo.tld")
+        monkeypatch.setenv("API_TOKEN", "secret")
+        result = config._resolve_instance_domains()
+        assert result == (("https://foo.tld", "secret"),)
+
+    def test_multi_domain_broadcast_token(self, monkeypatch):
+        """Multiple domains with a single token broadcast the token."""
+        monkeypatch.setenv("INSTANCE_DOMAIN", "foo.tld, bar.tld")
+        monkeypatch.setenv("API_TOKEN", "shared")
+        result = config._resolve_instance_domains()
+        assert result == (
+            ("https://foo.tld", "shared"),
+            ("https://bar.tld", "shared"),
+        )
+
+    def test_multi_domain_per_instance_tokens(self, monkeypatch):
+        """Comma-separated tokens are positionally paired with domains."""
+        monkeypatch.setenv("INSTANCE_DOMAIN", "a.tld,b.tld")
+        monkeypatch.setenv("API_TOKEN", "tok1,tok2")
+        result = config._resolve_instance_domains()
+        assert result == (("https://a.tld", "tok1"), ("https://b.tld", "tok2"))
+
+    def test_token_count_mismatch_raises(self, monkeypatch):
+        """Mismatched counts raise ValueError at parse time."""
+        monkeypatch.setenv("INSTANCE_DOMAIN", "a.tld,b.tld")
+        monkeypatch.setenv("API_TOKEN", "t1,t2,t3")
+        with pytest.raises(ValueError, match="counts must match"):
+            config._resolve_instance_domains()
+
+    def test_deduplicates_domains(self, monkeypatch):
+        """Duplicate domains are collapsed to a single entry."""
+        monkeypatch.setenv("INSTANCE_DOMAIN", "foo.tld, foo.tld")
+        monkeypatch.setenv("API_TOKEN", "tok")
+        result = config._resolve_instance_domains()
+        assert result == (("https://foo.tld", "tok"),)
+
+    def test_preserves_explicit_scheme(self, monkeypatch):
+        """Domains with explicit schemes keep them; others get https://."""
+        monkeypatch.setenv("INSTANCE_DOMAIN", "http://local:41447,bar.tld")
+        monkeypatch.setenv("API_TOKEN", "tok")
+        result = config._resolve_instance_domains()
+        assert result == (
+            ("http://local:41447", "tok"),
+            ("https://bar.tld", "tok"),
+        )
+
+    def test_empty_domain(self, monkeypatch):
+        """Empty INSTANCE_DOMAIN returns an empty tuple."""
+        monkeypatch.setenv("INSTANCE_DOMAIN", "")
+        monkeypatch.setenv("API_TOKEN", "tok")
+        result = config._resolve_instance_domains()
+        assert result == ()
+
+    def test_strips_trailing_slashes(self, monkeypatch):
+        """Trailing slashes are stripped from domains."""
+        monkeypatch.setenv("INSTANCE_DOMAIN", "foo.tld/")
+        monkeypatch.setenv("API_TOKEN", "tok")
+        result = config._resolve_instance_domains()
+        assert result == (("https://foo.tld", "tok"),)
+
+    def test_empty_token_broadcast(self, monkeypatch):
+        """Empty API_TOKEN broadcasts empty string to all instances."""
+        monkeypatch.setenv("INSTANCE_DOMAIN", "a.tld,b.tld")
+        monkeypatch.setenv("API_TOKEN", "")
+        result = config._resolve_instance_domains()
+        assert result == (("https://a.tld", ""), ("https://b.tld", ""))
+
+
+# ---------------------------------------------------------------------------
+# _resolve_instance_domain (legacy, kept for backward compatibility)
+# ---------------------------------------------------------------------------
+
+
 class TestResolveInstanceDomain:
     """Tests for :func:`config._resolve_instance_domain`."""
 
     def test_returns_instance_domain_when_set(self, monkeypatch):
         """Uses INSTANCE_DOMAIN when set."""
         monkeypatch.setenv("INSTANCE_DOMAIN", "mesh.example.com")
-        monkeypatch.delenv("POTATOMESH_INSTANCE", raising=False)
         result = config._resolve_instance_domain()
         assert result == "https://mesh.example.com"
 
     def test_adds_https_when_no_scheme(self, monkeypatch):
         """Adds https:// prefix when no scheme is present."""
         monkeypatch.setenv("INSTANCE_DOMAIN", "example.com")
-        monkeypatch.delenv("POTATOMESH_INSTANCE", raising=False)
         assert config._resolve_instance_domain() == "https://example.com"
 
     def test_preserves_existing_scheme(self, monkeypatch):
         """Leaves existing http:// scheme intact."""
         monkeypatch.setenv("INSTANCE_DOMAIN", "http://example.com")
-        monkeypatch.delenv("POTATOMESH_INSTANCE", raising=False)
         assert config._resolve_instance_domain() == "http://example.com"
 
     def test_strips_trailing_slash(self, monkeypatch):
         """Strips trailing slash from instance domain."""
         monkeypatch.setenv("INSTANCE_DOMAIN", "https://example.com/")
-        monkeypatch.delenv("POTATOMESH_INSTANCE", raising=False)
         assert config._resolve_instance_domain() == "https://example.com"
 
-    def test_falls_back_to_legacy_env(self, monkeypatch):
-        """Falls back to POTATOMESH_INSTANCE when INSTANCE_DOMAIN is absent."""
+    def test_returns_empty_when_not_set(self, monkeypatch):
+        """Returns empty string when INSTANCE_DOMAIN is unset."""
         monkeypatch.delenv("INSTANCE_DOMAIN", raising=False)
-        monkeypatch.setenv("POTATOMESH_INSTANCE", "legacy.example.com")
-        result = config._resolve_instance_domain()
-        assert result == "https://legacy.example.com"
-
-    def test_returns_empty_when_neither_set(self, monkeypatch):
-        """Returns empty string when neither env var is set."""
-        monkeypatch.delenv("INSTANCE_DOMAIN", raising=False)
-        monkeypatch.delenv("POTATOMESH_INSTANCE", raising=False)
         assert config._resolve_instance_domain() == ""
 
 
@@ -196,50 +262,110 @@ class TestDebugLog:
 
 
 # ---------------------------------------------------------------------------
-# PROVIDER validation
+# PROTOCOL validation
 # ---------------------------------------------------------------------------
 
 
-class TestProviderValidation:
-    """Tests for PROVIDER environment validation at import time."""
+class TestProtocolValidation:
+    """Tests for PROTOCOL environment validation at import time."""
 
-    def test_valid_provider_does_not_raise(self, monkeypatch):
-        """Importing config with a valid PROVIDER succeeds."""
+    def test_valid_protocol_does_not_raise(self, monkeypatch):
+        """Importing config with a valid PROTOCOL succeeds."""
         import importlib
 
-        monkeypatch.setenv("PROVIDER", "meshtastic")
+        monkeypatch.setenv("PROTOCOL", "meshtastic")
         # Re-importing should not raise
         importlib.reload(config)
 
-    def test_invalid_provider_raises_value_error(self, monkeypatch):
-        """An invalid PROVIDER value raises ValueError at module load."""
+    def test_invalid_protocol_raises_value_error(self, monkeypatch):
+        """An invalid PROTOCOL value raises ValueError at module load."""
         import importlib
 
-        monkeypatch.setenv("PROVIDER", "bogus_provider_xyz")
-        with pytest.raises(ValueError, match="Unknown PROVIDER"):
+        monkeypatch.setenv("PROTOCOL", "bogus_protocol_xyz")
+        with pytest.raises(ValueError, match="Unknown PROTOCOL"):
             importlib.reload(config)
         # Restore to valid value so subsequent tests work
-        monkeypatch.setenv("PROVIDER", "meshtastic")
+        monkeypatch.setenv("PROTOCOL", "meshtastic")
         importlib.reload(config)
 
 
 # ---------------------------------------------------------------------------
-# _ConfigModule proxy
+# _parse_lora_freq_env
 # ---------------------------------------------------------------------------
 
 
-class TestConfigModuleProxy:
-    """Tests for the :class:`config._ConfigModule` proxy behaviour."""
+class TestParseLoraFreqEnv:
+    """Tests for :func:`config._parse_lora_freq_env`."""
 
-    def test_connection_and_port_stay_in_sync(self):
-        """Setting CONNECTION also updates PORT and vice versa."""
-        original_connection = config.CONNECTION
-        original_port = config.PORT
-        try:
-            config.CONNECTION = "tcp://testhost"
-            assert config.PORT == "tcp://testhost"
-            config.PORT = "serial:/dev/ttyUSB0"
-            assert config.CONNECTION == "serial:/dev/ttyUSB0"
-        finally:
-            config.CONNECTION = original_connection
-            config.PORT = original_port
+    def test_none_returns_none(self):
+        """None input returns None."""
+        assert config._parse_lora_freq_env(None) is None
+
+    def test_empty_string_returns_none(self):
+        """Empty string returns None."""
+        assert config._parse_lora_freq_env("") is None
+
+    def test_whitespace_only_returns_none(self):
+        """Whitespace-only string returns None."""
+        assert config._parse_lora_freq_env("   ") is None
+
+    def test_integer_string_returns_int(self):
+        """Whole-number string returns int."""
+        result = config._parse_lora_freq_env("868")
+        assert result == 868
+        assert isinstance(result, int)
+
+    def test_float_integer_value_returns_int(self):
+        """String like '915.0' (whole float) returns int 915."""
+        result = config._parse_lora_freq_env("915.0")
+        assert result == 915
+        assert isinstance(result, int)
+
+    def test_decimal_string_returns_float(self):
+        """Decimal string returns float."""
+        result = config._parse_lora_freq_env("869.525")
+        assert result == pytest.approx(869.525)
+        assert isinstance(result, float)
+
+    def test_non_numeric_label_returns_none(self):
+        """Non-numeric string returns None so auto-detection is not blocked."""
+        assert config._parse_lora_freq_env("EU_868") is None
+
+    def test_unit_suffixed_string_returns_none(self):
+        """String like '915MHz' returns None (not numeric)."""
+        assert config._parse_lora_freq_env("915MHz") is None
+
+    def test_inf_returns_none(self):
+        """'inf' is non-finite and returns None."""
+        assert config._parse_lora_freq_env("inf") is None
+
+    def test_large_exponent_returns_none(self):
+        """'1e309' overflows to inf and returns None."""
+        assert config._parse_lora_freq_env("1e309") is None
+
+    def test_nan_returns_none(self):
+        """'nan' is non-finite and returns None."""
+        assert config._parse_lora_freq_env("nan") is None
+
+    def test_whitespace_stripped(self):
+        """Leading/trailing whitespace is ignored."""
+        assert config._parse_lora_freq_env("  919  ") == 919
+
+    def test_frequency_env_preseeds_lora_freq(self, monkeypatch):
+        """FREQUENCY env var pre-seeds LORA_FREQ at module load."""
+        import importlib
+
+        monkeypatch.setenv("FREQUENCY", "915")
+        importlib.reload(config)
+        assert config.LORA_FREQ == 915
+        # Restore
+        monkeypatch.delenv("FREQUENCY")
+        importlib.reload(config)
+
+    def test_no_frequency_env_leaves_lora_freq_none(self, monkeypatch):
+        """Absent FREQUENCY env var leaves LORA_FREQ as None."""
+        import importlib
+
+        monkeypatch.delenv("FREQUENCY", raising=False)
+        importlib.reload(config)
+        assert config.LORA_FREQ is None

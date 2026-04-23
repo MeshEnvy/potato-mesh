@@ -46,16 +46,23 @@ import { escapeHtml } from './utils.js';
 export { escapeHtml };
 
 import { computeBoundingBox, computeBoundsForPoints, haversineDistanceKm } from './map-bounds.js';
+import {
+  buildRenderableEntries,
+  computeColocatedOffsets,
+  isOffsetSignificant,
+  refreshSpiderPositions
+} from './map-colocated-offset.js';
 import { createMapAutoFitController } from './map-auto-fit-controller.js';
 import { resolveAutoFitBoundsConfig } from './map-auto-fit-settings.js';
 import { attachNodeInfoRefreshToMarker, overlayToPopupNode } from './map-marker-node-info.js';
 import { resolveLegendVisibility } from './map-legend-visibility.js';
 import { createMapFocusHandler, DEFAULT_NODE_FOCUS_ZOOM } from './nodes-map-focus.js';
+import { createMapCenterResetHandler } from './map-center-reset.js';
 import { enhanceCoordinateCell } from './nodes-coordinate-links.js';
 import { createShortInfoOverlayStack } from './short-info-overlay-manager.js';
 import { createNodeDetailOverlayManager } from './node-detail-overlay.js';
 import { refreshNodeInformation } from './node-details.js';
-import { extractModemMetadata, formatLoraFrequencyMHz, formatModemDisplay } from './node-modem-metadata.js';
+import { extractModemMetadata, formatLoraFrequencyMHz, formatModemDisplay, formatPresetDisplay } from './node-modem-metadata.js';
 import {
   TELEMETRY_FIELDS,
   buildTelemetryDisplayEntries,
@@ -81,7 +88,8 @@ import { CHAT_LOG_ENTRY_TYPES, buildChatTabModel, MAX_CHANNEL_INDEX } from './ch
 import { renderChatTabs } from './chat-tabs.js';
 import { formatPositionHighlights, formatTelemetryHighlights } from './chat-log-highlights.js';
 import { filterChatModel, normaliseChatFilterQuery } from './chat-search.js';
-import { buildMessageBody, buildMessageIndex, resolveReplyPrefix } from './message-replies.js';
+import { buildMessageIndex } from './message-replies.js';
+import { renderChatEntryContent } from './chat-entry-renderer.js';
 import {
   SNAPSHOT_WINDOW,
   aggregateNeighborSnapshots,
@@ -90,14 +98,16 @@ import {
   aggregateTelemetrySnapshots,
 } from './snapshot-aggregator.js';
 import { normalizeNodeCollection } from './node-snapshot-normalizer.js';
+import { maxRecordTimestamp, mergeById, mergeByCompositeKey, trimToLimit } from './incremental-helpers.js';
 import { buildTraceSegments } from './trace-paths.js';
 import {
   getRoleColor,
   getRoleKey,
   getRoleRenderPriority,
+  getRoleTextColor,
+  meshcoreRoleColors,
   normalizeRole,
   roleColors,
-  roleRenderOrder,
 } from './role-helpers.js';
 import {
   isMeshtasticProtocol,
@@ -128,30 +138,23 @@ import {
  */
 export function initializeApp(config) {
   const statusEl = document.getElementById('status');
-  const fitBoundsEl = document.getElementById('fitBounds');
-  const autoRefreshEl = document.getElementById('autoRefresh');
+  const footerActiveNodes = document.getElementById('footerActiveNodes');
   const refreshBtn = document.getElementById('refreshBtn');
+  const autorefreshToggle = document.getElementById('autorefreshToggle');
+  const protocolToggleMeshcore = document.getElementById('protocolToggleMeshcore');
+  const protocolToggleMeshtastic = document.getElementById('protocolToggleMeshtastic');
   const filterInput = document.getElementById('filterInput');
   const filterClearButton = document.getElementById('filterClear');
-  const themeToggle = document.getElementById('themeToggle');
-  const infoBtn = document.getElementById('infoBtn');
-  const infoOverlay = document.getElementById('infoOverlay');
-  const infoClose = document.getElementById('infoClose');
-  const infoDialog = infoOverlay ? infoOverlay.querySelector('.info-dialog') : null;
   const shortInfoTemplate = document.getElementById('shortInfoOverlayTemplate');
   const overlayStack = createShortInfoOverlayStack({ document, window, template: shortInfoTemplate });
   const titleEl = document.querySelector('title');
   const headerEl = document.querySelector('h1');
   const headerTitleTextEl = headerEl ? headerEl.querySelector('.site-title-text') : null;
   const chatEl = document.getElementById('chat');
-  const refreshInfo = document.getElementById('refreshInfo');
   const instanceSelect = document.getElementById('instanceSelect');
   const baseTitle = document.title;
   const nodesTable = document.getElementById('nodes');
   const sortButtons = nodesTable ? Array.from(nodesTable.querySelectorAll('thead .sort-button[data-sort-key]')) : [];
-  const infoOverlayHome = infoOverlay
-    ? { parent: infoOverlay.parentNode, nextSibling: infoOverlay.nextSibling }
-    : null;
   const bodyClassList = document.body ? document.body.classList : null;
   const isPrivateMode = document.body && document.body.dataset
     ? String(document.body.dataset.privateMode).toLowerCase() === 'true'
@@ -233,6 +236,18 @@ export function initializeApp(config) {
     applyNodeFallback: applyNodeNameFallback,
     logger: console,
   });
+  // Timestamps of the most recent record seen per data type.  Used to pass
+  // the ``since`` query parameter on subsequent refreshes so only new/changed
+  // rows are transferred over the wire.
+  let lastNodeTimestamp = 0;
+  let lastMessageTimestamp = 0;
+  let lastPositionTimestamp = 0;
+  let lastTelemetryTimestamp = 0;
+  let lastNeighborTimestamp = 0;
+  let lastTraceTimestamp = 0;
+  /** Whether the very first full fetch has completed. */
+  let initialFetchDone = false;
+
   const NODE_LIMIT = 1000;
   const TRACE_LIMIT = 200;
   const TRACE_MAX_AGE_SECONDS = 28 * 24 * 60 * 60;
@@ -242,13 +257,6 @@ export function initializeApp(config) {
   const REFRESH_MS = config.refreshMs;
   const CHAT_ENABLED = Boolean(config.chatEnabled);
   const instanceSelectorEnabled = Boolean(config.instancesFeatureEnabled);
-  if (refreshInfo) {
-    if (isDashboardView) {
-      refreshInfo.textContent = `${config.channel} (${config.frequency}) — active nodes: …`;
-    } else {
-      refreshInfo.textContent = '';
-    }
-  }
 
   if (instanceSelectorEnabled && instanceSelect) {
     void initializeInstanceSelector({
@@ -262,7 +270,8 @@ export function initializeApp(config) {
 
   /** @type {ReturnType<typeof setTimeout>|null} */
   let refreshTimer = null;
-  let refreshInfoRequestId = 0;
+  let autorefreshPaused = false;
+  let activeStatsRequestId = 0;
 
   /**
    * Close any open short-info overlays that do not contain the provided anchor.
@@ -460,22 +469,18 @@ export function initializeApp(config) {
    */
   function restartAutoRefresh() {
     // Tear down any existing timer so the interval never double-fires when
-    // the user toggles auto-refresh or the config is re-applied.
+    // the config is re-applied.
     if (refreshTimer) {
       clearInterval(refreshTimer);
       refreshTimer = null;
     }
-    // Only arm the timer when the auto-refresh checkbox is checked; a
-    // disabled checkbox (e.g. during an active fetch) keeps it off.
-    if (autoRefreshEl && autoRefreshEl.checked) {
+    // Only arm the timer when a positive interval is configured; a zero or
+    // negative value means auto-refresh is intentionally disabled.
+    // When the user has explicitly paused auto-refresh, skip arming the timer
+    // entirely so no background API requests are made.
+    if (REFRESH_MS > 0 && !autorefreshPaused) {
       refreshTimer = setInterval(refresh, REFRESH_MS);
     }
-  }
-
-  if (fitBoundsEl && mapZoomOverride !== null) {
-    fitBoundsEl.checked = false;
-    fitBoundsEl.disabled = true;
-    fitBoundsEl.setAttribute('aria-disabled', 'true');
   }
 
   const MAP_CENTER_COORDS = Object.freeze({ lat: config.mapCenter.lat, lon: config.mapCenter.lon });
@@ -483,6 +488,7 @@ export function initializeApp(config) {
   const mapContainer = document.getElementById('map');
   const mapPanel = document.getElementById('mapPanel');
   const mapFullscreenToggle = document.getElementById('mapFullscreenToggle');
+  const mapCenterResetEl = document.getElementById('mapCenterReset');
   const fullscreenContainer = mapPanel || mapContainer;
   const isFederationView = bodyClassList ? bodyClassList.contains('view-federation') : false;
   const legendDefaultCollapsed = mapPanel ? mapPanel.dataset.legendCollapsed === 'true' : false;
@@ -510,6 +516,17 @@ export function initializeApp(config) {
   let neighborLinesToggleButton = null;
   let traceLinesToggleButton = null;
   let markersLayer = null;
+  let spiderLinesLayer = null;
+  // Per-render record of the offset markers we created so the zoom event
+  // handlers can re-project them and keep the on-screen pixel gap constant
+  // regardless of zoom level.  Each entry is
+  // `{ marker, line, lat, lon, dx, dy }` where `lat`/`lon` are the original
+  // (un-offset) coordinates.
+  let colocatedSpiderState = [];
+  // requestAnimationFrame handle used to coalesce per-frame `zoom` events
+  // into a single refresh; reset to ``null`` once the scheduled callback
+  // runs so the next frame can schedule again.
+  let pendingSpiderRefreshHandle = null;
   let tileDomObserver = null;
   const fullscreenChangeEvents = [
     'fullscreenchange',
@@ -520,7 +537,7 @@ export function initializeApp(config) {
   ];
 
   const autoFitController = createMapAutoFitController({
-    toggleEl: fitBoundsEl,
+    toggleEl: null,
     windowObject: typeof window !== 'undefined' ? window : undefined,
     defaultPaddingPx: AUTO_FIT_PADDING_PX
   });
@@ -533,6 +550,14 @@ export function initializeApp(config) {
     setMapCenter: value => {
       mapCenterLatLng = value;
     }
+  });
+
+  const centerResetHandler = createMapCenterResetHandler({
+    getMap: () => map,
+    autoFitController,
+    fitMapToBounds,
+    mapCenterCoords: MAP_CENTER_COORDS,
+    mapZoomOverride,
   });
 
   /**
@@ -727,62 +752,6 @@ export function initializeApp(config) {
   });
 
   /**
-   * Append the informational modal overlay to the fullscreen container when active.
-   *
-   * @returns {void}
-   */
-  function attachInfoOverlayToFullscreenHost() {
-    if (!infoOverlay || !fullscreenContainer) return;
-    if (infoOverlay.parentNode !== fullscreenContainer) {
-      fullscreenContainer.appendChild(infoOverlay);
-    }
-    if (infoOverlay.classList) {
-      infoOverlay.classList.add('info-overlay--fullscreen');
-    }
-  }
-
-  /**
-   * Restore the informational overlay to its original DOM position.
-   *
-   * @returns {void}
-   */
-  function restoreInfoOverlayToHome() {
-    if (!infoOverlay || !infoOverlayHome || !infoOverlayHome.parent) return;
-    if (infoOverlay.parentNode === infoOverlayHome.parent) {
-      if (infoOverlay.classList) {
-        infoOverlay.classList.remove('info-overlay--fullscreen');
-      }
-      return;
-    }
-    if (
-      infoOverlayHome.nextSibling &&
-      infoOverlayHome.nextSibling.parentNode === infoOverlayHome.parent &&
-      typeof infoOverlayHome.parent.insertBefore === 'function'
-    ) {
-      infoOverlayHome.parent.insertBefore(infoOverlay, infoOverlayHome.nextSibling);
-    } else if (typeof infoOverlayHome.parent.appendChild === 'function') {
-      infoOverlayHome.parent.appendChild(infoOverlay);
-    }
-    if (infoOverlay.classList) {
-      infoOverlay.classList.remove('info-overlay--fullscreen');
-    }
-  }
-
-  /**
-   * Ensure the informational overlay participates in the active fullscreen subtree.
-   *
-   * @returns {void}
-   */
-  function syncInfoOverlayHost() {
-    if (!infoOverlay) return;
-    if (isMapInFullscreen()) {
-      attachInfoOverlayToFullscreenHost();
-    } else {
-      restoreInfoOverlayToHome();
-    }
-  }
-
-  /**
    * Respond to fullscreen change events originating from the browser.
    *
    * @returns {void}
@@ -812,7 +781,6 @@ export function initializeApp(config) {
         mapContainer.style.minHeight = '';
       }
     }
-    syncInfoOverlayHost();
     updateFullscreenToggleState();
     refreshMapSize();
   }
@@ -833,10 +801,69 @@ export function initializeApp(config) {
     }
   }
 
-  syncInfoOverlayHost();
+  if (mapCenterResetEl) {
+    mapCenterResetEl.addEventListener('click', event => {
+      event.preventDefault();
+      centerResetHandler();
+    });
+  }
 
+  /** @type {Set<string>} Hidden role compound keys — roles in this set are excluded from display. */
   const activeRoleFilters = new Set();
+  /** @type {Map<string, HTMLElement>} Compound key → legend button element. */
   const legendRoleButtons = new Map();
+  /** @type {Set<string>} Protocols hidden by the user via legend toggles. */
+  const hiddenProtocols = new Set();
+  const legendProtocolButtons = new Map();
+
+  /**
+   * Wrap a legend button click handler so it always calls
+   * ``preventDefault`` and ``stopPropagation`` before running the body.
+   *
+   * Centralising this prevents the two-line boilerplate from repeating in
+   * every legend button handler, reducing token-level duplication.
+   *
+   * @param {function(Event): void} fn Handler body.
+   * @returns {function(Event): void} Full click listener.
+   */
+  function legendClickHandler(fn) {
+    return (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      fn(event);
+    };
+  }
+
+  /**
+   * Canonical protocol token for use in compound filter keys.
+   *
+   * Collapses null/absent/unknown protocol values to ``'meshtastic'`` so that
+   * pre-protocol legacy records land in the Meshtastic filter bucket.
+   *
+   * @param {string|null|undefined} protocol Raw protocol value.
+   * @returns {'meshtastic'|'meshcore'} Normalised protocol token.
+   */
+  function normalizeFilterProtocol(protocol) {
+    return isMeshcoreProtocol(protocol) ? 'meshcore' : 'meshtastic';
+  }
+
+  /**
+   * Build a compound filter key that encodes both protocol and role.
+   *
+   * Using compound keys avoids collisions between role names that appear in
+   * both Meshtastic and MeshCore (e.g. ``SENSOR``, ``REPEATER``).  The filter
+   * set stores these keys so that clicking the MeshCore SENSOR button only
+   * includes MeshCore SENSOR nodes, not Meshtastic ones.
+   *
+   * @param {*} role Raw role value from the API.
+   * @param {string|null|undefined} protocol Protocol string from the API.
+   * @returns {string} Compound key in the form ``"<protocol>:<roleKey>"``.
+   */
+  function makeRoleFilterKey(role, protocol) {
+    return `${normalizeFilterProtocol(protocol)}:${getRoleKey(role)}`;
+  }
+
+
 
   /**
    * Lazily create the floating map status element used for progress messages.
@@ -1300,7 +1327,24 @@ export function initializeApp(config) {
 
     neighborLinesLayer = L.layerGroup().addTo(map);
     traceLinesLayer = L.layerGroup().addTo(map);
+    // Spider lines render between the connection lines and the markers so the
+    // dashed white "leader" lines are visible against neighbour/trace overlays
+    // but never sit on top of the marker glyphs themselves.
+    spiderLinesLayer = L.layerGroup().addTo(map);
     markersLayer = L.layerGroup().addTo(map);
+
+    // Pixel-space offsets are baked into a LatLng at render time, so the
+    // on-screen spread would otherwise scale with zoom — at extreme zoom-outs
+    // the offset becomes many degrees wide and the markers fly off-screen
+    // when the user later zooms in.  Recompute continuously throughout every
+    // zoom task: the `zoom` event fires per animation frame and is throttled
+    // through `requestAnimationFrame` to coalesce redundant updates into a
+    // single redraw per frame; `zoomend` snaps to the final position; and
+    // `viewreset` covers projection resets such as resize / fullscreen /
+    // dateline wrap.
+    map.on('zoom', scheduleColocatedSpiderRefresh);
+    map.on('zoomend', refreshColocatedSpiderState);
+    map.on('viewreset', refreshColocatedSpiderState);
 
     if (typeof navigator !== 'undefined' && navigator && navigator.onLine === false) {
       activateOfflineTiles('Offline mode detected. Using placeholder basemap.');
@@ -1320,6 +1364,10 @@ export function initializeApp(config) {
 
   let legendContainer = null;
   let legendToggleControl = null;
+  let meshcoreCountEl = null;
+  let meshtasticCountEl = null;
+  let meshcoreColEl = null;
+  let meshtasticColEl = null;
   let legendToggleButton = null;
   let legendVisible = true;
 
@@ -1366,32 +1414,47 @@ export function initializeApp(config) {
    * @returns {void}
    */
   /**
-   * Build a Meshtastic protocol icon ``<img>`` element via DOM APIs.
+   * Build a protocol icon ``<img>`` element via DOM APIs.
    *
-   * Used wherever an icon node must be appended rather than injected via
-   * ``innerHTML``.  Mirrors the attribute set used by {@link meshtasticIconHtml}
-   * so the rendered output is identical.
+   * Shared implementation used by {@link buildMeshtasticIconImg} and
+   * {@link buildMeshcoreIconImg}.  Mirrors the attribute set produced by
+   * the HTML-string helpers in ``protocol-helpers.js`` so the rendered
+   * output is identical regardless of insertion method.
    *
+   * @param {string} src Absolute path to the SVG asset.
+   * @param {string} variantClass BEM modifier class, e.g. ``protocol-icon--meshtastic``.
    * @returns {HTMLImageElement} Icon element ready to append.
    */
-  function buildMeshtasticIconImg() {
+  function buildProtocolIconImg(src, variantClass) {
     const img = document.createElement('img');
-    img.setAttribute('src', MESHTASTIC_ICON_SRC);
+    img.setAttribute('src', src);
     img.setAttribute('alt', '');
     img.setAttribute('width', '12');
     img.setAttribute('height', '12');
     img.setAttribute('aria-hidden', 'true');
     img.setAttribute('loading', 'lazy');
     img.setAttribute('decoding', 'async');
-    img.className = 'protocol-icon protocol-icon--meshtastic';
+    img.className = `protocol-icon ${variantClass}`;
     return img;
+  }
+
+  /** @returns {HTMLImageElement} Meshtastic protocol icon element. */
+  function buildMeshtasticIconImg() {
+    return buildProtocolIconImg(MESHTASTIC_ICON_SRC, 'protocol-icon--meshtastic');
+  }
+
+  /** @returns {HTMLImageElement} MeshCore protocol icon element. */
+  function buildMeshcoreIconImg() {
+    return buildProtocolIconImg(MESHCORE_ICON_SRC, 'protocol-icon--meshcore');
   }
 
   function updateNeighborLinesToggleState() {
     if (!neighborLinesToggleButton) return;
     const label = neighborLinesVisible ? 'Hide neighbor lines' : 'Show neighbor lines';
-    neighborLinesToggleButton.replaceChildren(buildMeshtasticIconImg(), document.createTextNode(` ${label}`));
-    neighborLinesToggleButton.setAttribute('aria-pressed', neighborLinesVisible ? 'true' : 'false');
+    neighborLinesToggleButton.textContent = label;
+    // aria-pressed reflects whether the user has *activated* the toggle (i.e. lines are
+    // currently hidden). When lines are visible (default), the button is unpressed.
+    neighborLinesToggleButton.setAttribute('aria-pressed', neighborLinesVisible ? 'false' : 'true');
     neighborLinesToggleButton.setAttribute('aria-label', label);
   }
 
@@ -1422,8 +1485,9 @@ export function initializeApp(config) {
   function updateTraceLinesToggleState() {
     if (!traceLinesToggleButton) return;
     const label = traceLinesVisible ? 'Hide trace lines' : 'Show trace lines';
-    traceLinesToggleButton.replaceChildren(buildMeshtasticIconImg(), document.createTextNode(` ${label}`));
-    traceLinesToggleButton.setAttribute('aria-pressed', traceLinesVisible ? 'true' : 'false');
+    traceLinesToggleButton.textContent = label;
+    // aria-pressed reflects whether the user has *activated* the toggle (lines hidden).
+    traceLinesToggleButton.setAttribute('aria-pressed', traceLinesVisible ? 'false' : 'true');
     traceLinesToggleButton.setAttribute('aria-label', label);
   }
 
@@ -1453,47 +1517,143 @@ export function initializeApp(config) {
    */
   function updateLegendRoleFiltersUI() {
     const hasFilters = activeRoleFilters.size > 0;
-    legendRoleButtons.forEach((button, role) => {
+    // activeRoleFilters is a *hidden-roles* set: roles present in the set are
+    // hidden.  Buttons show aria-pressed="true" when the role is *visible*
+    // (i.e. NOT in the hidden set) so that the default all-visible state
+    // highlights every button.
+    legendRoleButtons.forEach((button, compoundKey) => {
       if (!button) return;
-      const isActive = activeRoleFilters.has(role);
-      button.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+      const isHidden = activeRoleFilters.has(compoundKey);
+      button.setAttribute('aria-pressed', isHidden ? 'false' : 'true');
     });
     if (legendContainer) {
-      if (hasFilters) {
+      if (hasFilters || hiddenProtocols.size > 0) {
         legendContainer.setAttribute('data-has-active-filters', 'true');
       } else {
         legendContainer.removeAttribute('data-has-active-filters');
       }
     }
+    updateMetaProtocolToggleUI();
     updateLegendToggleState();
   }
 
   /**
-   * Toggle the visibility filter for a given role.
+   * Sync the meta-row protocol toggle buttons with the current
+   * {@link hiddenProtocols} state.
    *
-   * @param {string} role Role identifier.
+   * When a protocol is hidden the button's ``<img>`` receives a greyscale
+   * filter and ``aria-pressed`` is set to ``"true"``.
+   *
    * @returns {void}
    */
-  function toggleRoleFilter(role) {
-    if (!role) return;
-    if (activeRoleFilters.has(role)) {
-      activeRoleFilters.delete(role);
+  function updateMetaProtocolToggleUI() {
+    /** @type {Array<{btn: HTMLElement|null, protocol: string, name: string}>} */
+    const toggles = [
+      { btn: protocolToggleMeshcore, protocol: 'meshcore', name: 'MeshCore' },
+      { btn: protocolToggleMeshtastic, protocol: 'meshtastic', name: 'Meshtastic' },
+    ];
+    toggles.forEach(({ btn, protocol, name }) => {
+      if (!btn) return;
+      const isHidden = hiddenProtocols.has(protocol);
+      btn.setAttribute('aria-pressed', isHidden ? 'true' : 'false');
+      btn.setAttribute('aria-label', isHidden ? `Show ${name} nodes` : `Hide ${name} nodes`);
+      const img = btn.querySelector('.protocol-toggle-icon');
+      if (img) {
+        img.style.filter = isHidden ? 'grayscale(1) opacity(0.4)' : '';
+      }
+    });
+  }
+
+  /**
+   * Toggle the visibility filter for a role+protocol combination.
+   *
+   * @param {string} compoundKey Compound key in the form ``"<protocol>:<roleKey>"``.
+   * @returns {void}
+   */
+  function toggleRoleFilter(compoundKey) {
+    if (!compoundKey) return;
+    if (activeRoleFilters.has(compoundKey)) {
+      activeRoleFilters.delete(compoundKey);
     } else {
-      activeRoleFilters.add(role);
+      activeRoleFilters.add(compoundKey);
     }
     updateLegendRoleFiltersUI();
     applyFilter();
   }
 
+  /**
+   * Build role filter buttons for a given palette and append them to a column.
+   *
+   * Each button is keyed by a compound ``"<protocol>:<roleKey>"`` string so
+   * that roles sharing a name across protocols (e.g. ``SENSOR``, ``REPEATER``)
+   * produce independent buttons without colliding in {@link legendRoleButtons}.
+   *
+   * @param {HTMLElement} colEl Column container element.
+   * @param {Record<string,string>} palette Role→colour map to render.
+   * @param {'meshtastic'|'meshcore'} protocol Protocol token for this column.
+   * @returns {void}
+   */
+  function buildRoleButtons(colEl, palette, protocol) {
+    for (const [role, color] of Object.entries(palette)) {
+      if (!CHAT_ENABLED && role === 'CLIENT_HIDDEN') continue;
+      const compoundKey = makeRoleFilterKey(role, protocol);
+      const item = document.createElement('button');
+      item.className = 'legend-item';
+      colEl.appendChild(item);
+      item.type = 'button';
+      item.setAttribute('aria-pressed', 'true');
+      item.dataset.role = role;
+      item.dataset.protocol = protocol;
+      const swatch = document.createElement('span');
+      swatch.className = 'legend-swatch';
+      item.appendChild(swatch);
+      swatch.style.background = color;
+      swatch.setAttribute('aria-hidden', 'true');
+      const label = document.createElement('span');
+      label.className = 'legend-label';
+      item.appendChild(label);
+      label.textContent = role;
+      item.addEventListener('click', legendClickHandler(event => {
+        const exclusive = event.metaKey || event.ctrlKey;
+        if (exclusive) {
+          // Ctrl/Cmd+Click: hide only this role (all others become visible).
+          activeRoleFilters.clear();
+          activeRoleFilters.add(compoundKey);
+          updateLegendRoleFiltersUI();
+          applyFilter();
+        } else {
+          toggleRoleFilter(compoundKey);
+        }
+      }));
+      legendRoleButtons.set(compoundKey, item);
+    }
+  }
+
   if (map && hasLeaflet) {
-    const legend = L.control({ position: 'bottomright' });
+    // Single combined control: [toggle button | legend panel] in a flex row.
+    // The toggle sits to the left so it remains accessible when the legend is collapsed.
+    const legendControl = L.control({ position: 'bottomright' });
     /**
-     * Leaflet control factory that renders the legend UI.
+     * Leaflet control factory that renders the toggle button and legend panel
+     * as a single side-by-side control.
      *
-     * @returns {HTMLElement} Legend DOM element.
+     * @returns {HTMLElement} Wrapper element containing both children.
      */
-    legend.onAdd = function () {
-      const div = L.DomUtil.create('div', 'legend');
+    legendControl.onAdd = function () {
+      const wrapper = L.DomUtil.create('div', 'legend-outer');
+
+      // --- Toggle button (left) ---
+      const button = L.DomUtil.create('button', 'legend-toggle-button', wrapper);
+      button.type = 'button';
+      button.setAttribute('aria-pressed', 'true');
+      button.setAttribute('aria-controls', 'mapLegend');
+      button.addEventListener('click', legendClickHandler(() => {
+        setLegendVisibility(!legendVisible);
+      }));
+      legendToggleButton = button;
+
+      // --- Legend panel (right) ---
+      const div = L.DomUtil.create('div', 'legend', wrapper);
       div.id = 'mapLegend';
       div.setAttribute('role', 'region');
       div.setAttribute('aria-label', 'Map legend');
@@ -1503,101 +1663,72 @@ export function initializeApp(config) {
       const title = L.DomUtil.create('span', 'legend-title', header);
       title.textContent = 'Legend';
 
-      const itemsContainer = L.DomUtil.create('div', 'legend-items', div);
-    legendRoleButtons.clear();
-    for (const [role, color] of Object.entries(roleColors)) {
-      if (!CHAT_ENABLED && role === 'CLIENT_HIDDEN') continue;
-      const item = L.DomUtil.create('button', 'legend-item', itemsContainer);
-      item.type = 'button';
-      item.setAttribute('aria-pressed', 'false');
-        item.dataset.role = role;
-        item.appendChild(buildMeshtasticIconImg());
-        const swatch = L.DomUtil.create('span', 'legend-swatch', item);
-        swatch.style.background = color;
-        swatch.setAttribute('aria-hidden', 'true');
-        const label = L.DomUtil.create('span', 'legend-label', item);
-        label.textContent = role;
-        item.addEventListener('click', event => {
-          event.preventDefault();
-          event.stopPropagation();
-          const exclusive = event.metaKey || event.ctrlKey;
-          if (exclusive) {
-            activeRoleFilters.clear();
-            activeRoleFilters.add(role);
-            updateLegendRoleFiltersUI();
-            applyFilter();
-          } else {
-            toggleRoleFilter(role);
-          }
-        });
-        legendRoleButtons.set(role, item);
-      }
-      updateLegendRoleFiltersUI();
+      const itemsContainer = L.DomUtil.create('div', 'legend-items legend-items--columns', div);
 
-      const toggle = L.DomUtil.create('div', 'legend-toggle', div);
-      neighborLinesToggleButton = L.DomUtil.create('button', 'legend-item legend-toggle-neighbors', toggle);
+      // --- MeshCore column (left, bottom-aligned) ---
+      const meshcoreCol = L.DomUtil.create('div', 'legend-column legend-column--bottom', itemsContainer);
+      meshcoreColEl = meshcoreCol;
+      const meshcoreColHeader = L.DomUtil.create('div', 'legend-column-header', meshcoreCol);
+      meshcoreColHeader.appendChild(buildMeshcoreIconImg());
+      const meshcoreColTitle = document.createElement('span');
+      meshcoreColTitle.textContent = 'MeshCore';
+      meshcoreColHeader.appendChild(meshcoreColTitle);
+      meshcoreCountEl = document.createElement('span');
+      meshcoreCountEl.className = 'legend-protocol-count';
+      meshcoreColHeader.appendChild(meshcoreCountEl);
+
+      // --- Meshtastic column (right) ---
+      const meshtasticCol = L.DomUtil.create('div', 'legend-column', itemsContainer);
+      meshtasticColEl = meshtasticCol;
+      const meshtasticColHeader = L.DomUtil.create('div', 'legend-column-header', meshtasticCol);
+      meshtasticColHeader.appendChild(buildMeshtasticIconImg());
+      const meshtasticColTitle = document.createElement('span');
+      meshtasticColTitle.textContent = 'Meshtastic';
+      meshtasticColHeader.appendChild(meshtasticColTitle);
+      meshtasticCountEl = document.createElement('span');
+      meshtasticCountEl.className = 'legend-protocol-count';
+      meshtasticColHeader.appendChild(meshtasticCountEl);
+
+      legendRoleButtons.clear();
+      buildRoleButtons(meshcoreCol, meshcoreRoleColors, 'meshcore');
+      buildRoleButtons(meshtasticCol, roleColors, 'meshtastic');
+
+      // --- Meshtastic column: line toggles at bottom ---
+      neighborLinesToggleButton = L.DomUtil.create('button', 'legend-item legend-toggle-neighbors', meshtasticCol);
       neighborLinesToggleButton.type = 'button';
-      neighborLinesToggleButton.addEventListener('click', event => {
-        event.preventDefault();
-        event.stopPropagation();
+      neighborLinesToggleButton.addEventListener('click', legendClickHandler(() => {
         setNeighborLinesVisibility(!neighborLinesVisible);
-      });
+      }));
       updateNeighborLinesToggleState();
 
-      traceLinesToggleButton = L.DomUtil.create('button', 'legend-item legend-toggle-traces', toggle);
+      traceLinesToggleButton = L.DomUtil.create('button', 'legend-item legend-toggle-traces', meshtasticCol);
       traceLinesToggleButton.type = 'button';
-      traceLinesToggleButton.addEventListener('click', event => {
-        event.preventDefault();
-        event.stopPropagation();
+      traceLinesToggleButton.addEventListener('click', legendClickHandler(() => {
         setTraceLinesVisibility(!traceLinesVisible);
-      });
+      }));
       updateTraceLinesToggleState();
 
-      const resetButton = L.DomUtil.create('button', 'legend-item legend-reset', toggle);
+      updateLegendRoleFiltersUI();
+
+      // --- Clear filters — full-width below the two columns ---
+      const filterToggle = L.DomUtil.create('div', 'legend-toggle', div);
+
+      const resetButton = L.DomUtil.create('button', 'legend-item legend-reset', filterToggle);
       resetButton.type = 'button';
       resetButton.textContent = 'Clear filters';
-      resetButton.addEventListener('click', event => {
-        event.preventDefault();
-        event.stopPropagation();
+      resetButton.addEventListener('click', legendClickHandler(() => {
         activeRoleFilters.clear();
+        hiddenProtocols.clear();
         updateLegendRoleFiltersUI();
         applyFilter();
-      });
+      }));
 
-      L.DomEvent.disableClickPropagation(div);
-      L.DomEvent.disableScrollPropagation(div);
-
-      return div;
-    };
-    legend.addTo(map);
-    legendContainer = legend.getContainer();
-
-    legendToggleControl = L.control({ position: 'bottomright' });
-    /**
-     * Leaflet control factory for the legend visibility toggle.
-     *
-     * @returns {HTMLElement} Toggle button element.
-     */
-    legendToggleControl.onAdd = function () {
-      const container = L.DomUtil.create('div', 'leaflet-control legend-toggle');
-      const button = L.DomUtil.create('button', 'legend-toggle-button', container);
-      button.type = 'button';
-      button.textContent = 'Hide legend (filters)';
-      button.setAttribute('aria-pressed', 'true');
-      button.setAttribute('aria-label', 'Hide map legend');
-      button.setAttribute('aria-controls', 'mapLegend');
-      button.addEventListener('click', event => {
-        event.preventDefault();
-        event.stopPropagation();
-        setLegendVisibility(!legendVisible);
-      });
-      legendToggleButton = button;
       updateLegendToggleState();
-      L.DomEvent.disableClickPropagation(container);
-      L.DomEvent.disableScrollPropagation(container);
-      return container;
+      L.DomEvent.disableClickPropagation(wrapper);
+      L.DomEvent.disableScrollPropagation(wrapper);
+      return wrapper;
     };
-    legendToggleControl.addTo(map);
+    legendControl.addTo(map);
 
     const legendMediaQuery = window.matchMedia('(max-width: 1024px)');
     const initialLegendVisible = resolveLegendVisibility({
@@ -1612,72 +1743,6 @@ export function initializeApp(config) {
     });
   } else if (mapContainer && !hasLeaflet) {
     setLegendVisibility(false);
-  }
-
-    themeToggle.addEventListener('click', () => {
-      const dark = document.body.classList.toggle('dark');
-      const themeValue = dark ? 'dark' : 'light';
-      document.body.setAttribute('data-theme', themeValue);
-      if (document.documentElement) {
-        document.documentElement.setAttribute('data-theme', themeValue);
-      }
-      themeToggle.textContent = dark ? '☀️' : '🌙';
-      if (window.__themeCookie) {
-        if (typeof window.__themeCookie.persistTheme === 'function') {
-          window.__themeCookie.persistTheme(themeValue);
-        } else if (typeof window.__themeCookie.setCookie === 'function') {
-          window.__themeCookie.setCookie('theme', themeValue);
-        }
-      }
-      window.dispatchEvent(new CustomEvent('themechange', { detail: { theme: themeValue } }));
-      if (typeof window.applyFiltersToAllTiles === 'function') window.applyFiltersToAllTiles();
-    });
-
-  let lastFocusBeforeInfo = null;
-
-  /**
-   * Display the modal overlay containing site information.
-   *
-   * @returns {void}
-   */
-  function openInfoOverlay() {
-    if (!infoOverlay || !infoDialog) return;
-    syncInfoOverlayHost();
-    lastFocusBeforeInfo = document.activeElement;
-    infoOverlay.hidden = false;
-    document.body.style.setProperty('overflow', 'hidden');
-    infoDialog.focus();
-  }
-
-  /**
-   * Hide the site information overlay and restore focus.
-   *
-   * @returns {void}
-   */
-  function closeInfoOverlay() {
-    if (!infoOverlay || !infoDialog) return;
-    infoOverlay.hidden = true;
-    document.body.style.removeProperty('overflow');
-    const target = lastFocusBeforeInfo && typeof lastFocusBeforeInfo.focus === 'function' ? lastFocusBeforeInfo : infoBtn;
-    if (target && typeof target.focus === 'function') {
-      target.focus();
-    }
-    lastFocusBeforeInfo = null;
-  }
-
-  if (infoBtn && infoOverlay && infoClose) {
-    infoBtn.addEventListener('click', openInfoOverlay);
-    infoClose.addEventListener('click', closeInfoOverlay);
-    infoOverlay.addEventListener('click', event => {
-      if (event.target === infoOverlay) {
-        closeInfoOverlay();
-      }
-    });
-    document.addEventListener('keydown', event => {
-      if (event.key === 'Escape' && !infoOverlay.hidden) {
-        closeInfoOverlay();
-      }
-    });
   }
 
   const nodeDetailOverlayManager = createNodeDetailOverlayManager({
@@ -1845,11 +1910,29 @@ export function initializeApp(config) {
       infoAttr = attrParts.join('');
     }
     if (!short) {
-      return `<span class="short-name" style="background:#ccc"${titleAttr}${infoAttr}>?&nbsp;&nbsp;&nbsp;</span>`;
+      return `<span class="short-name" style="background:#ccc"${titleAttr}${infoAttr}>&nbsp;?&nbsp;</span>`;
     }
-    const padded = escapeHtml(String(short).padStart(4, ' ')).replace(/ /g, '&nbsp;');
-    const color = getRoleColor(roleValue);
-    return `<span class="short-name" style="background:${color}"${titleAttr}${infoAttr}>${padded}</span>`;
+    // Pad the label for the badge.  For plain-ASCII names that are already
+    // 4 characters (meshtastic always stores exactly 4) no padding is added.
+    // Shorter names or names containing emoji/non-ASCII get a single space
+    // on each side — grapheme width varies too much for character-count
+    // centering to work reliably.
+    const raw = String(short);
+    const graphemeCount = typeof Intl !== 'undefined' && Intl.Segmenter
+      ? [...new Intl.Segmenter().segment(raw)].length
+      : raw.length;
+    let centred;
+    if (graphemeCount >= 4) {
+      centred = raw;
+    } else {
+      centred = ` ${raw} `;
+    }
+    const padded = escapeHtml(centred).replace(/ /g, '&nbsp;');
+    const protocol = nodeData?.protocol ?? null;
+    const color = getRoleColor(roleValue, protocol);
+    const textColor = getRoleTextColor(roleValue, protocol);
+    const styleAttr = textColor ? `background:${color};color:${textColor}` : `background:${color}`;
+    return `<span class="short-name" style="${styleAttr}"${titleAttr}${infoAttr}>${padded}</span>`;
   }
 
   const potatoMeshNamespace = globalThis.PotatoMesh || (globalThis.PotatoMesh = {});
@@ -2266,7 +2349,7 @@ export function initializeApp(config) {
       }
     }
     const shortParts = [];
-    const shortHtml = renderShortHtml(overlayInfo.shortName, overlayInfo.role, overlayInfo.longName);
+    const shortHtml = renderShortHtml(overlayInfo.shortName, overlayInfo.role, overlayInfo.longName, overlayInfo);
     if (shortHtml) {
       shortParts.push(shortHtml);
     }
@@ -3005,38 +3088,39 @@ export function initializeApp(config) {
     );
     const tsDate = tsSeconds != null ? new Date(tsSeconds * 1000) : null;
     const ts = tsDate ? formatTime(tsDate) : '--:--:--';
-    const short = renderShortHtml(m.node?.short_name, m.node?.role, m.node?.long_name, m.node);
     const messageProtocol = pickFirstProperty([m, m?.node], ['protocol']);
+
     const nodeProtocolPrefix = protocolIconPrefixHtml(messageProtocol);
-    const replyPrefix = resolveReplyPrefix({
+
+    // Delegate reply-prefix / mention / body / encrypted rendering to the
+    // shared chat entry renderer so the dashboard and the node detail page
+    // produce identical message HTML.  The renderer also returns the parsed
+    // MeshCore sender prefix and any name-resolved sender node so we can
+    // reuse them for the badge below without duplicating the lookup.
+    const { html: text, meshcoreSenderNode } = renderChatEntryContent({
       message: m,
-      messagesById,
       nodesById,
+      messagesById,
       renderShortHtml,
-      escapeHtml
+      escapeHtml,
+      renderEmojiHtml,
+      formatEncryptedMessageNotice,
     });
 
-    let messageBodyHtml = '';
-    if (m && m.encrypted) {
-      const notice = formatEncryptedMessageNotice(m);
-      if (notice && typeof notice === 'object') {
-        const content = notice.content ?? '';
-        messageBodyHtml = notice.isHtml ? content : escapeHtml(content);
-      } else {
-        messageBodyHtml = '';
-      }
+    // Sender badge: prefer the ingestor-hydrated node; fall back to the
+    // MeshCore name-based lookup performed inside the shared renderer for
+    // channel messages whose sender wasn't yet known to the contacts roster.
+    let short;
+    if (!m.node && meshcoreSenderNode) {
+      short = renderShortHtml(
+        meshcoreSenderNode.short_name ?? meshcoreSenderNode.shortName,
+        meshcoreSenderNode.role,
+        meshcoreSenderNode.long_name ?? meshcoreSenderNode.longName,
+        meshcoreSenderNode
+      );
     } else {
-      messageBodyHtml = buildMessageBody({
-        message: m || {},
-        escapeHtml,
-        renderEmojiHtml
-      });
+      short = renderShortHtml(m.node?.short_name, m.node?.role, m.node?.long_name, m.node);
     }
-
-    const combinedSegments = [];
-    if (replyPrefix) combinedSegments.push(replyPrefix);
-    if (messageBodyHtml) combinedSegments.push(messageBodyHtml);
-    const text = combinedSegments.length > 0 ? combinedSegments.join(' ') : '';
     const metadata = extractChatMessageMetadata(m);
     const prefix = formatChatMessagePrefix({
       timestamp: escapeHtml(ts),
@@ -3163,8 +3247,24 @@ export function initializeApp(config) {
     });
 
     const enrichedLogEntries = attachNodeContextToLogEntries(logEntries);
+    // When a protocol is hidden, exclude its entries from the chat display.
+    // Entries without a resolved node are kept; entries with a node but a
+    // null/missing protocol are treated as meshtastic (the default protocol).
+    const protocolVisibleEntries = hiddenProtocols.size > 0
+      ? enrichedLogEntries.filter(e => {
+        if (!e || !e.node) return true;
+        const proto = normalizeFilterProtocol(e.node.protocol);
+        return !hiddenProtocols.has(proto);
+      })
+      : enrichedLogEntries;
+    const protocolVisibleChannels = hiddenProtocols.size > 0
+      ? channels.filter(ch => {
+        const proto = ch.protocol ? normalizeFilterProtocol(ch.protocol) : null;
+        return !proto || !hiddenProtocols.has(proto);
+      })
+      : channels;
     const { logEntries: filteredLogEntries, channels: filteredChannels } = filterChatModel(
-      { logEntries: enrichedLogEntries, channels },
+      { logEntries: protocolVisibleEntries, channels: protocolVisibleChannels },
       filterQuery
     );
 
@@ -3176,7 +3276,7 @@ export function initializeApp(config) {
 
     const channelTabs = filteredChannels.map(channel => ({
       id: channel.id || `channel-${channel.index}`,
-      label: channel.label,
+      label: `${channel.label} (${channel.messageCount})`,
       iconSrc: isMeshtasticProtocol(channel.protocol)
         ? MESHTASTIC_ICON_SRC
         : isMeshcoreProtocol(channel.protocol)
@@ -3485,11 +3585,14 @@ export function initializeApp(config) {
    * Fetch the latest nodes from the JSON API.
    *
    * @param {number} [limit=NODE_LIMIT] Maximum number of records.
+   * @param {number} [since=0] Unix timestamp; only rows newer than this are returned.
    * @returns {Promise<Array<Object>>} Parsed node payloads.
    */
-  async function fetchNodes(limit = NODE_LIMIT) {
+  async function fetchNodes(limit = NODE_LIMIT, since = 0) {
     const effectiveLimit = resolveSnapshotLimit(limit, NODE_LIMIT);
-    const r = await fetch(`/api/nodes?limit=${effectiveLimit}`, { cache: 'no-store' });
+    let url = `/api/nodes?limit=${effectiveLimit}`;
+    if (since > 0) url += `&since=${since}`;
+    const r = await fetch(url, { cache: 'default' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
   }
@@ -3504,7 +3607,7 @@ export function initializeApp(config) {
     if (typeof nodeId !== 'string') return null;
     const trimmed = nodeId.trim();
     if (trimmed.length === 0) return null;
-    const r = await fetch(`/api/nodes/${encodeURIComponent(trimmed)}`, { cache: 'no-store' });
+    const r = await fetch(`/api/nodes/${encodeURIComponent(trimmed)}`, { cache: 'default' });
     if (r.status === 404) return null;
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
@@ -3514,7 +3617,7 @@ export function initializeApp(config) {
    * Fetch recent messages from the JSON API.
    *
    * @param {number} [limit=NODE_LIMIT] Maximum number of rows.
-   * @param {{ encrypted?: boolean }} [options] Optional retrieval flags.
+   * @param {{ encrypted?: boolean, since?: number }} [options] Optional retrieval flags.
    * @returns {Promise<Array<Object>>} Parsed message payloads.
    */
   async function fetchMessages(limit = MESSAGE_LIMIT, options = {}) {
@@ -3524,8 +3627,11 @@ export function initializeApp(config) {
     if (options && options.encrypted) {
       params.set('encrypted', 'true');
     }
+    if (options && options.since > 0) {
+      params.set('since', String(options.since));
+    }
     const query = params.toString();
-    const r = await fetch(`/api/messages?${query}`, { cache: 'no-store' });
+    const r = await fetch(`/api/messages?${query}`, { cache: 'default' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
   }
@@ -3534,11 +3640,14 @@ export function initializeApp(config) {
    * Fetch neighbour information from the JSON API.
    *
    * @param {number} [limit=NODE_LIMIT] Maximum number of rows.
+   * @param {number} [since=0] Unix timestamp; only rows newer than this are returned.
    * @returns {Promise<Array<Object>>} Parsed neighbour payloads.
    */
-  async function fetchNeighbors(limit = NODE_LIMIT) {
+  async function fetchNeighbors(limit = NODE_LIMIT, since = 0) {
     const effectiveLimit = resolveSnapshotLimit(limit, NODE_LIMIT);
-    const r = await fetch(`/api/neighbors?limit=${effectiveLimit}`, { cache: 'no-store' });
+    let url = `/api/neighbors?limit=${effectiveLimit}`;
+    if (since > 0) url += `&since=${since}`;
+    const r = await fetch(url, { cache: 'default' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
   }
@@ -3547,12 +3656,15 @@ export function initializeApp(config) {
    * Fetch traceroute observations from the JSON API.
    *
    * @param {number} [limit=TRACE_LIMIT] Maximum number of records.
+   * @param {number} [since=0] Unix timestamp; only rows newer than this are returned.
    * @returns {Promise<Array<Object>>} Parsed trace payloads.
    */
-  async function fetchTraces(limit = TRACE_LIMIT) {
+  async function fetchTraces(limit = TRACE_LIMIT, since = 0) {
     const safeLimit = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : TRACE_LIMIT;
     const effectiveLimit = Math.min(safeLimit, NODE_LIMIT);
-    const r = await fetch(`/api/traces?limit=${effectiveLimit}`, { cache: 'no-store' });
+    let url = `/api/traces?limit=${effectiveLimit}`;
+    if (since > 0) url += `&since=${since}`;
+    const r = await fetch(url, { cache: 'default' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const traces = await r.json();
     return filterRecentTraces(traces, TRACE_MAX_AGE_SECONDS);
@@ -3562,11 +3674,14 @@ export function initializeApp(config) {
    * Fetch telemetry entries from the JSON API.
    *
    * @param {number} [limit=NODE_LIMIT] Maximum number of rows.
+   * @param {number} [since=0] Unix timestamp; only rows newer than this are returned.
    * @returns {Promise<Array<Object>>} Parsed telemetry payloads.
    */
-  async function fetchTelemetry(limit = NODE_LIMIT) {
+  async function fetchTelemetry(limit = NODE_LIMIT, since = 0) {
     const effectiveLimit = resolveSnapshotLimit(limit, NODE_LIMIT);
-    const r = await fetch(`/api/telemetry?limit=${effectiveLimit}`, { cache: 'no-store' });
+    let url = `/api/telemetry?limit=${effectiveLimit}`;
+    if (since > 0) url += `&since=${since}`;
+    const r = await fetch(url, { cache: 'default' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
   }
@@ -3575,11 +3690,14 @@ export function initializeApp(config) {
    * Fetch position packets from the JSON API.
    *
    * @param {number} [limit=NODE_LIMIT] Maximum number of rows.
+   * @param {number} [since=0] Unix timestamp; only rows newer than this are returned.
    * @returns {Promise<Array<Object>>} Parsed position payloads.
    */
-  async function fetchPositions(limit = NODE_LIMIT) {
+  async function fetchPositions(limit = NODE_LIMIT, since = 0) {
     const effectiveLimit = resolveSnapshotLimit(limit, NODE_LIMIT);
-    const r = await fetch(`/api/positions?limit=${effectiveLimit}`, { cache: 'no-store' });
+    let url = `/api/positions?limit=${effectiveLimit}`;
+    if (since > 0) url += `&since=${since}`;
+    const r = await fetch(url, { cache: 'default' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
   }
@@ -3595,6 +3713,7 @@ export function initializeApp(config) {
     const num = typeof value === 'number' ? value : Number(value);
     return Number.isFinite(num) ? num : null;
   }
+
 
   /**
    * Determine the best-effort timestamp in seconds from numeric or ISO values.
@@ -3851,9 +3970,12 @@ export function initializeApp(config) {
       const modemMetadata = extractModemMetadata(n);
       const loraFrequencyText = formatLoraFrequencyMHz(modemMetadata.loraFreq);
       const loraFrequencyDisplay = loraFrequencyText ? escapeHtml(loraFrequencyText) : '';
-      const modemPresetDisplay = modemMetadata.modemPreset ? escapeHtml(modemMetadata.modemPreset) : '';
-      const longNameHtml = renderNodeLongNameLink(n.long_name, n.node_id, { protocol: n.protocol });
+      const resolvedPreset = formatPresetDisplay(modemMetadata.modemPreset, modemMetadata.loraFreq);
+      const modemPresetDisplay = resolvedPreset ? escapeHtml(resolvedPreset) : '';
+      const longNameHtml = renderNodeLongNameLink(n.long_name, n.node_id);
+      const protocolIconCell = protocolIconPrefixHtml(n.protocol);
       tr.innerHTML = `
+        <td class="nodes-col nodes-col--protocol">${protocolIconCell}</td>
         <td class="mono nodes-col nodes-col--node-id">${n.node_id || ""}</td>
         <td class="nodes-col nodes-col--short-name">${renderShortHtml(n.short_name, n.role, n.long_name, n)}</td>
         <td class="nodes-col nodes-col--long-name">${longNameHtml}</td>
@@ -3904,6 +4026,58 @@ export function initializeApp(config) {
   }
 
   /**
+   * Project a base coordinate to its co-located display position by adding a
+   * pixel-space offset against the live map projection.
+   *
+   * @param {number} lat Original latitude in degrees.
+   * @param {number} lon Original longitude in degrees.
+   * @param {number} dx Pixel offset along the layer-point X axis.
+   * @param {number} dy Pixel offset along the layer-point Y axis.
+   * @returns {[number, number]} Display ``[lat, lng]`` for the marker.
+   */
+  function projectColocatedOffsetLatLng(lat, lon, dx, dy) {
+    if (dx === 0 && dy === 0) return [lat, lon];
+    const basePoint = map.latLngToLayerPoint([lat, lon]);
+    const offsetPoint = L.point(basePoint.x + dx, basePoint.y + dy);
+    const projected = map.layerPointToLatLng(offsetPoint);
+    return [projected.lat, projected.lng];
+  }
+
+  /**
+   * Re-project every co-located marker (and its spider leader line) so the
+   * pixel gap between markers stays constant after the user zooms.  Wired to
+   * the map's ``zoomend`` and ``viewreset`` events from {@link initializeApp},
+   * and reached via the rAF-throttled {@link scheduleColocatedSpiderRefresh}
+   * for the per-frame ``zoom`` event.
+   *
+   * @returns {void}
+   */
+  function refreshColocatedSpiderState() {
+    if (!map) return;
+    refreshSpiderPositions(colocatedSpiderState, projectColocatedOffsetLatLng);
+  }
+
+  /**
+   * Throttled wrapper around {@link refreshColocatedSpiderState} that
+   * coalesces multiple ``zoom`` events fired inside a single animation frame
+   * into one update.  Falls back to an immediate call when the host has no
+   * ``requestAnimationFrame`` (e.g. unit-test environments).
+   *
+   * @returns {void}
+   */
+  function scheduleColocatedSpiderRefresh() {
+    if (typeof requestAnimationFrame !== 'function') {
+      refreshColocatedSpiderState();
+      return;
+    }
+    if (pendingSpiderRefreshHandle !== null) return;
+    pendingSpiderRefreshHandle = requestAnimationFrame(() => {
+      pendingSpiderRefreshHandle = null;
+      refreshColocatedSpiderState();
+    });
+  }
+
+  /**
    * Render the Leaflet map markers and neighbour connections.
    *
    * @param {Array<Object>} nodes Node payloads.
@@ -3920,6 +4094,12 @@ export function initializeApp(config) {
     if (traceLinesLayer) {
       traceLinesLayer.clearLayers();
     }
+    if (spiderLinesLayer) {
+      spiderLinesLayer.clearLayers();
+    }
+    // Drop the previous render's spider records before populating them again
+    // so the zoom handler does not try to reposition stale Leaflet objects.
+    colocatedSpiderState = [];
     markersLayer.clearLayers();
     const pts = [];
     const nodesById = new Map();
@@ -3933,7 +4113,7 @@ export function initializeApp(config) {
       ? buildTraceSegments(allTraces, nodes, {
           limitDistance: LIMIT_DISTANCE,
           maxDistanceKm: MAX_DISTANCE_KM,
-          colorForNode: node => getRoleColor(node.role)
+          colorForNode: node => getRoleColor(node.role, node.protocol)
         })
       : [];
 
@@ -3973,7 +4153,7 @@ export function initializeApp(config) {
         if (LIMIT_DISTANCE && sourceNode.distance_km != null && sourceNode.distance_km > MAX_DISTANCE_KM) continue;
         if (LIMIT_DISTANCE && targetNode.distance_km != null && targetNode.distance_km > MAX_DISTANCE_KM) continue;
 
-        const priority = getRoleRenderPriority(sourceNode.role);
+        const priority = getRoleRenderPriority(sourceNode.role, sourceNode.protocol);
         const rxTimeRaw = entry.rx_time;
         let rxTime = 0;
         if (typeof rxTimeRaw === 'number' && Number.isFinite(rxTimeRaw)) {
@@ -3991,7 +4171,7 @@ export function initializeApp(config) {
 
         neighborSegments.push({
           latlngs: [[srcLat, srcLon], [tgtLat, tgtLon]],
-          color: getRoleColor(sourceNode.role),
+          color: getRoleColor(sourceNode.role, sourceNode.protocol),
           priority,
           rxTime,
           sourceId,
@@ -4123,22 +4303,39 @@ export function initializeApp(config) {
     const nodesByRenderOrder = nodes
       .map((node, index) => ({ node, index }))
       .sort((a, b) => {
-        const orderA = getRoleRenderPriority(a.node && a.node.role);
-        const orderB = getRoleRenderPriority(b.node && b.node.role);
+        const orderA = getRoleRenderPriority(a.node && a.node.role, a.node && a.node.protocol);
+        const orderB = getRoleRenderPriority(b.node && b.node.role, b.node && b.node.protocol);
         if (orderA !== orderB) return orderA - orderB;
         return a.index - b.index;
       })
       .map(entry => entry.node);
 
-    for (const n of nodesByRenderOrder) {
-      const latRaw = n.latitude, lonRaw = n.longitude;
-      if (latRaw == null || latRaw === '' || lonRaw == null || lonRaw === '') continue;
-      const lat = Number(latRaw), lon = Number(lonRaw);
-      if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
-      if (LIMIT_DISTANCE && n.distance_km != null && n.distance_km > MAX_DISTANCE_KM) continue;
+    // Pre-pass: parse + filter renderable entries once so co-located nodes can
+    // be spread visually before any marker is created.  Resolving entries up
+    // front (via the helper module so the parsing rules stay unit-testable)
+    // means LIMIT_DISTANCE-filtered nodes do not influence per-coordinate
+    // group sizes.
+    const renderableEntries = buildRenderableEntries(nodesByRenderOrder, {
+      maxDistanceKm: LIMIT_DISTANCE ? MAX_DISTANCE_KM : null
+    });
 
-      const color = getRoleColor(n.role);
-      const marker = L.circleMarker([lat, lon], {
+    const offsets = computeColocatedOffsets(renderableEntries);
+    for (const { entry, dx, dy } of offsets) {
+      const n = entry.node;
+      const { lat, lon } = entry;
+
+      // Translate the pixel-space offset into the LatLng to render at.  The
+      // baked-in LatLng is correct for the current zoom only; the zoom event
+      // handlers re-project on zoom/zoomend/viewreset to keep the gap
+      // visually constant when the user changes zoom.  Use the helper-level
+      // significance test (rather than strict !== 0) because trig at angles
+      // like π produces values around 1e-15 which would otherwise pass the
+      // strict check and cause us to draw zero-length spider lines.
+      const markerLatLng = projectColocatedOffsetLatLng(lat, lon, dx, dy);
+      const isOffset = isOffsetSignificant(dx, dy);
+
+      const color = getRoleColor(n.role, n.protocol);
+      const marker = L.circleMarker(markerLatLng, {
         radius: 9,
         color: '#000',
         weight: 1,
@@ -4147,9 +4344,31 @@ export function initializeApp(config) {
         opacity: 0.7
       });
 
+      // Draw a faint dotted leader line from each co-located marker back to
+      // the shared physical location so the spider hub is visually obvious.
+      // Singleton markers (no offset) get no line.  Stroke colour, dash,
+      // weight and opacity all live in `.colocated-spider-line` so the line
+      // can pick up theme-aware tokens (var(--fg)) and stay legible on both
+      // light and dark basemaps without code changes here.
+      let spiderLine = null;
+      if (isOffset && spiderLinesLayer) {
+        spiderLine = L.polyline([[lat, lon], markerLatLng], {
+          interactive: false,
+          className: 'colocated-spider-line'
+        }).addTo(spiderLinesLayer);
+      }
+
       const fallbackOverlayProvider = () => mergeOverlayDetails(null, n);
       let markerToken = 0;
       marker.addTo(markersLayer);
+      // Track every offset marker so the zoomend handler can reposition the
+      // marker + leader line in lock-step.  Singletons skip the record since
+      // their position never changes between zooms.
+      if (isOffset) {
+        colocatedSpiderState.push({ marker, line: spiderLine, lat, lon, dx, dy });
+      }
+      // Use the original coordinates for fitBounds so sub-pixel display
+      // offsets cannot widen the auto-fit window.
       pts.push([lat, lon]);
 
       attachNodeInfoRefreshToMarker({
@@ -4198,10 +4417,6 @@ export function initializeApp(config) {
         },
       });
     }
-    if (pts.length && fitBoundsEl && fitBoundsEl.checked) {
-      const bounds = computeBoundsForPoints(pts, { ...autoFitBoundsConfig });
-      fitMapToBounds(bounds, { animate: false, paddingPx: AUTO_FIT_PADDING_PX });
-    }
     overlayStack.cleanupOrphans();
   }
 
@@ -4222,13 +4437,36 @@ export function initializeApp(config) {
   /**
    * Test whether a node matches the active role filters.
    *
+   * Filters use compound ``"<protocol>:<roleKey>"`` keys so that shared role
+   * names (e.g. ``SENSOR``, ``REPEATER``) can be toggled independently per
+   * protocol.  Nodes whose protocol is null/absent are treated as Meshtastic
+   * (via {@link normalizeFilterProtocol}) to keep legacy records visible when
+   * the Meshtastic SENSOR filter is active.
+   *
    * @param {Object} node Node payload.
    * @returns {boolean} True when the node should be visible.
    */
   function matchesRoleFilter(node) {
     if (!activeRoleFilters.size) return true;
-    const roleKey = getRoleKey(node && node.role);
-    return activeRoleFilters.has(roleKey);
+    const compoundKey = makeRoleFilterKey(node && node.role, node && node.protocol);
+    return !activeRoleFilters.has(compoundKey);
+  }
+
+  /**
+   * Check whether a node passes the active protocol visibility filters.
+   *
+   * Nodes with a null/absent protocol are always shown — hiding
+   * ``'meshtastic'`` hides only nodes that explicitly carry that protocol
+   * value.  Pre-protocol legacy records remain visible regardless.
+   *
+   * @param {Object} node Node payload.
+   * @returns {boolean} True when the node should be visible.
+   */
+  function matchesProtocolFilter(node) {
+    if (!hiddenProtocols.size) return true;
+    const protocol = (node && node.protocol) || null;
+    if (protocol && hiddenProtocols.has(protocol)) return false;
+    return true;
   }
 
   /**
@@ -4240,6 +4478,31 @@ export function initializeApp(config) {
     if (!filterInput || !filterClearButton) return;
     const hasValue = filterInput.value && filterInput.value.length > 0;
     filterClearButton.hidden = !hasValue;
+  }
+
+  /**
+   * Return a copy of the stats object with totals reduced by the counts of
+   * any protocols the user has explicitly hidden.
+   *
+   * Per-protocol sub-objects are left untouched so legend column counts and
+   * visibility decisions still use the raw server values.
+   *
+   * @param {Object|null} stats Normalised stats from ``/api/stats``.
+   * @returns {Object|null} Adjusted stats (new object) or the original if nothing is hidden.
+   */
+  function adjustStatsForHiddenProtocols(stats) {
+    if (!hiddenProtocols.size || !stats) return stats;
+    const adjusted = { ...stats };
+    for (const protocol of hiddenProtocols) {
+      const bucket = stats[protocol];
+      if (!bucket || typeof bucket !== 'object') continue;
+      for (const key of ['hour', 'day', 'week', 'month']) {
+        if (typeof adjusted[key] === 'number' && typeof bucket[key] === 'number') {
+          adjusted[key] = Math.max(0, adjusted[key] - bucket[key]);
+        }
+      }
+    }
+    return adjusted;
   }
 
   /**
@@ -4256,13 +4519,26 @@ export function initializeApp(config) {
     // Text and role filters apply only to the node table and map; the chat log
     // always receives the full node collection so reply-thread lookups succeed
     // even for nodes that are currently hidden by the active filter.
-    const filteredNodes = allNodes.filter(n => matchesTextFilter(n, q) && matchesRoleFilter(n));
+    const filteredNodes = allNodes.filter(n => matchesTextFilter(n, q) && matchesRoleFilter(n) && matchesProtocolFilter(n));
     const sortedNodes = sortNodes(filteredNodes);
     const nowSec = Date.now()/1000;
     renderTable(sortedNodes, nowSec);
     renderMap(sortedNodes, nowSec);
-    updateCount(sortedNodes, nowSec);
-    updateRefreshInfo(sortedNodes, nowSec);
+    // Show an immediate local estimate for the title so it doesn't flicker
+    // to (0) while waiting for the async /api/stats response.
+    const localStats = computeLocalActiveNodeStats(allNodes, nowSec);
+    updateTitleCount(adjustStatsForHiddenProtocols(localStats));
+    // Title, legend, footer, and visibility are then corrected by /api/stats
+    // which provides the authoritative, uncapped counts.
+    const statsRequestId = ++activeStatsRequestId;
+    void fetchActiveNodeStats({ nodes: allNodes, nowSeconds: nowSec }).then(stats => {
+      if (statsRequestId !== activeStatsRequestId) return;
+      const visibleStats = adjustStatsForHiddenProtocols(stats);
+      updateTitleCount(visibleStats);
+      updateLegendProtocolCounts(stats);
+      updateFooterStats(visibleStats);
+      applyProtocolVisibility(stats);
+    });
     updateSortIndicators();
     // Pass the raw filterQuery (not the normalised form) so the chat log can
     // highlight matching substrings in their original case.
@@ -4314,49 +4590,102 @@ export function initializeApp(config) {
       if (statusEl) {
         statusEl.textContent = 'refreshing…';
       }
+      // On the first load fetch the full dataset; subsequent refreshes pass
+      // the ``since`` timestamp so only new/changed rows are transferred.
+      // A 1-second overlap avoids missing rows that arrive at the boundary.
+      const useSince = initialFetchDone;
+      const nodeSince = useSince ? Math.max(0, lastNodeTimestamp - 1) : 0;
+      const msgSince = useSince ? Math.max(0, lastMessageTimestamp - 1) : 0;
+      const posSince = useSince ? Math.max(0, lastPositionTimestamp - 1) : 0;
+      const telSince = useSince ? Math.max(0, lastTelemetryTimestamp - 1) : 0;
+      const nbSince = useSince ? Math.max(0, lastNeighborTimestamp - 1) : 0;
+      const trSince = useSince ? Math.max(0, lastTraceTimestamp - 1) : 0;
+
       // Secondary fetches are fire-and-forget with individual error handlers so
       // that a failure in one stream (e.g. telemetry) does not abort the whole
       // refresh cycle.  Each promise resolves to an empty array on error, which
       // preserves the previous data until the next successful fetch.
-      const neighborPromise = fetchNeighbors().catch(err => {
+      const neighborPromise = fetchNeighbors(NODE_LIMIT, nbSince).catch(err => {
         console.warn('neighbor refresh failed; continuing without connections', err);
         return [];
       });
-      const telemetryPromise = fetchTelemetry().catch(err => {
+      const telemetryPromise = fetchTelemetry(NODE_LIMIT, telSince).catch(err => {
         console.warn('telemetry refresh failed; continuing without telemetry', err);
         return [];
       });
-      const positionsPromise = fetchPositions().catch(err => {
+      const positionsPromise = fetchPositions(NODE_LIMIT, posSince).catch(err => {
         console.warn('position refresh failed; continuing without updates', err);
         return [];
       });
-      const tracesPromise = fetchTraces().catch(err => {
+      const tracesPromise = fetchTraces(TRACE_LIMIT, trSince).catch(err => {
         console.warn('trace refresh failed; continuing without traceroutes', err);
         return [];
       });
-      const encryptedMessagesPromise = fetchMessages(MESSAGE_LIMIT, { encrypted: true }).catch(err => {
+      const encryptedMessagesPromise = fetchMessages(MESSAGE_LIMIT, { encrypted: true, since: msgSince }).catch(err => {
         console.warn('encrypted message refresh failed; continuing without encrypted entries', err);
         return [];
       });
       // Fan-out all requests simultaneously; nodes are the primary resource and
       // must succeed for rendering to proceed.
       const [
-        nodes,
-        positions,
-        neighborTuples,
-        traceEntries,
-        messages,
-        telemetryEntries,
-        encryptedMessages
+        incomingNodes,
+        incomingPositions,
+        incomingNeighbors,
+        incomingTraces,
+        incomingMessages,
+        incomingTelemetry,
+        incomingEncryptedMessages
       ] = await Promise.all([
-        fetchNodes(),
+        fetchNodes(NODE_LIMIT, nodeSince),
         positionsPromise,
         neighborPromise,
         tracesPromise,
-        fetchMessages(MESSAGE_LIMIT),
+        fetchMessages(MESSAGE_LIMIT, { since: msgSince }),
         telemetryPromise,
         encryptedMessagesPromise
       ]);
+
+      // Update high-water marks for incremental fetching.
+      const incomingNodeTs = maxRecordTimestamp(incomingNodes, ['last_heard']);
+      const incomingMsgTs = maxRecordTimestamp(incomingMessages, ['rx_time']);
+      const incomingEncMsgTs = maxRecordTimestamp(incomingEncryptedMessages, ['rx_time']);
+      const incomingPosTs = maxRecordTimestamp(incomingPositions, ['rx_time', 'position_time']);
+      const incomingTelTs = maxRecordTimestamp(incomingTelemetry, ['rx_time', 'telemetry_time']);
+      const incomingNbTs = maxRecordTimestamp(incomingNeighbors, ['rx_time']);
+      const incomingTrTs = maxRecordTimestamp(incomingTraces, ['rx_time']);
+      if (incomingNodeTs > lastNodeTimestamp) lastNodeTimestamp = incomingNodeTs;
+      const latestMsgTs = Math.max(incomingMsgTs, incomingEncMsgTs);
+      if (latestMsgTs > lastMessageTimestamp) lastMessageTimestamp = latestMsgTs;
+      if (incomingPosTs > lastPositionTimestamp) lastPositionTimestamp = incomingPosTs;
+      if (incomingTelTs > lastTelemetryTimestamp) lastTelemetryTimestamp = incomingTelTs;
+      if (incomingNbTs > lastNeighborTimestamp) lastNeighborTimestamp = incomingNbTs;
+      if (incomingTrTs > lastTraceTimestamp) lastTraceTimestamp = incomingTrTs;
+
+      // Merge incremental results with existing data.  On first load the
+      // existing arrays are empty so the merge is effectively a no-op.
+      // Merge incremental results with existing data then trim to the
+      // configured limits so long-running tabs do not accumulate stale
+      // entries beyond what the server would return on a fresh fetch.
+      const nodes = useSince ? mergeById(allNodes, incomingNodes, 'node_id') : incomingNodes;
+      const positions = useSince
+        ? trimToLimit(mergeById(allPositionEntries, incomingPositions, 'id'), NODE_LIMIT)
+        : incomingPositions;
+      const neighborTuples = useSince
+        ? mergeByCompositeKey(allNeighbors, incomingNeighbors, ['node_id', 'neighbor_id'])
+        : incomingNeighbors;
+      const telemetryEntries = useSince
+        ? trimToLimit(mergeById(allTelemetryEntries, incomingTelemetry, 'id'), NODE_LIMIT)
+        : incomingTelemetry;
+      const traceEntries = useSince
+        ? trimToLimit(mergeById(allTraces, incomingTraces, 'id'), TRACE_LIMIT)
+        : incomingTraces;
+      const messages = useSince
+        ? trimToLimit(mergeById(allMessages, incomingMessages, 'id'), MESSAGE_LIMIT)
+        : incomingMessages;
+      const encryptedMessages = useSince
+        ? trimToLimit(mergeById(allEncryptedMessages, incomingEncryptedMessages, 'id'), MESSAGE_LIMIT)
+        : incomingEncryptedMessages;
+
       // Collapse per-source snapshot arrays into single merged records; the
       // snapshot window de-duplicates entries from multiple ingestors.
       const aggregatedNodes = aggregateNodeSnapshots(nodes);
@@ -4386,6 +4715,7 @@ export function initializeApp(config) {
       allPositionEntries = aggregatedPositions;
       allNeighbors = aggregatedNeighbors;
       allTraces = Array.isArray(traceEntries) ? traceEntries : [];
+      initialFetchDone = true;
       applyFilter();
       if (statusEl) {
         statusEl.textContent = 'updated ' + new Date().toLocaleTimeString();
@@ -4398,8 +4728,8 @@ export function initializeApp(config) {
     }
   }
 
-  // Kick off the first data load immediately; interval-based auto-refresh
-  // begins only if the checkbox is already checked on page load.
+  // Kick off the first data load immediately then start the silent background
+  // auto-refresh timer.
   refresh();
   restartAutoRefresh();
 
@@ -4408,29 +4738,64 @@ export function initializeApp(config) {
     refreshBtn.addEventListener('click', refresh);
   }
 
-  if (autoRefreshEl) {
-    // When the user enables auto-refresh mid-session, trigger an immediate
-    // fetch so the UI does not sit stale until the next interval fires.
-    autoRefreshEl.addEventListener('change', () => {
-      restartAutoRefresh();
-      if (autoRefreshEl.checked) {
+  // --- Auto-refresh play/pause toggle ---
+  if (autorefreshToggle) {
+    autorefreshToggle.addEventListener('click', () => {
+      autorefreshPaused = !autorefreshPaused;
+      if (autorefreshPaused) {
+        if (refreshTimer) {
+          clearInterval(refreshTimer);
+          refreshTimer = null;
+        }
+        autorefreshToggle.textContent = '\u25B6';
+        autorefreshToggle.setAttribute('aria-label', 'Resume auto-refresh');
+        autorefreshToggle.setAttribute('aria-pressed', 'true');
+        if (statusEl) statusEl.textContent = 'Refresh paused.';
+      } else {
+        autorefreshToggle.textContent = '\u23F8';
+        autorefreshToggle.setAttribute('aria-label', 'Pause auto-refresh');
+        autorefreshToggle.setAttribute('aria-pressed', 'false');
         refresh();
+        restartAutoRefresh();
       }
     });
   }
 
+  // --- Meta-row protocol toggle buttons ---
   /**
-   * Update the count badge showing how many nodes are displayed.
+   * Wire a meta-row protocol toggle button to the shared
+   * {@link hiddenProtocols} set.
    *
-   * @param {Array<Object>} nodes Node payloads.
-   * @param {number} nowSec Reference timestamp.
+   * @param {HTMLElement|null} btn Button element.
+   * @param {string} protocol Protocol token (``'meshcore'`` or ``'meshtastic'``).
    * @returns {void}
    */
-  function updateCount(nodes, nowSec) {
-    const dayAgoSec = nowSec - 86400;
-    const count = nodes.filter(n => n.last_heard && Number(n.last_heard) >= dayAgoSec).length;
+  function setupMetaProtocolToggle(btn, protocol) {
+    if (!btn) return;
+    btn.addEventListener('click', () => {
+      if (hiddenProtocols.has(protocol)) {
+        hiddenProtocols.delete(protocol);
+      } else {
+        hiddenProtocols.add(protocol);
+      }
+      updateMetaProtocolToggleUI();
+      updateLegendRoleFiltersUI();
+      applyFilter();
+    });
+  }
+  setupMetaProtocolToggle(protocolToggleMeshcore, 'meshcore');
+  setupMetaProtocolToggle(protocolToggleMeshtastic, 'meshtastic');
+
+  /**
+   * Update the page/tab title with the total active-node count for the past 7 days.
+   *
+   * @param {{week: number}} stats Active-node stats from /api/stats.
+   * @returns {void}
+   */
+  function updateTitleCount(stats) {
+    const count = stats?.week ?? 0;
     const text = `${baseTitle} (${count})`;
-    titleEl.textContent = text;
+    if (titleEl) titleEl.textContent = text;
     if (headerTitleTextEl) {
       headerTitleTextEl.textContent = text;
     } else if (headerEl) {
@@ -4439,26 +4804,54 @@ export function initializeApp(config) {
   }
 
   /**
-   * Update the status message describing the currently rendered data.
+   * Update legend column headers with per-protocol active node counts (7 days).
    *
-   * @param {Array<Object>} nodes Node payloads.
-   * @param {number} nowSec Reference timestamp.
+   * @param {{meshcore?: {week: number}, meshtastic?: {week: number}}} stats Stats from /api/stats.
    * @returns {void}
    */
-  function updateRefreshInfo(nodes, nowSec) {
-    if (!refreshInfo || !isDashboardView) {
-      return;
-    }
-    const requestId = ++refreshInfoRequestId;
-    void fetchActiveNodeStats({ nodes, nowSeconds: nowSec }).then(stats => {
-      if (requestId !== refreshInfoRequestId) {
-        return;
-      }
-      refreshInfo.textContent = formatActiveNodeStatsText({
-        channel: config.channel,
-        frequency: config.frequency,
-        stats
-      });
+  function updateLegendProtocolCounts(stats) {
+    if (!meshcoreCountEl && !meshtasticCountEl) return;
+    if (meshcoreCountEl) meshcoreCountEl.textContent = ` (${stats?.meshcore?.week ?? 0})`;
+    if (meshtasticCountEl) meshtasticCountEl.textContent = ` (${stats?.meshtastic?.week ?? 0})`;
+  }
+
+  /**
+   * Update the footer active-node stats element with day/week/month counts.
+   *
+   * @param {{day: number, week: number, month: number, sampled: boolean}} stats Stats from /api/stats.
+   * @returns {void}
+   */
+  function updateFooterStats(stats) {
+    if (!footerActiveNodes) return;
+    footerActiveNodes.textContent = 'Active: ' + formatActiveNodeStatsText({ stats });
+  }
+
+  /**
+   * Hide/show UI elements based on per-protocol activity in the past 7 days.
+   *
+   * Hides the Charts nav link when meshtastic has no active nodes, and hides
+   * legend columns for protocols with zero weekly activity.
+   *
+   * @param {{meshcore?: {week: number}, meshtastic?: {week: number}}} stats Stats from /api/stats.
+   * @returns {void}
+   */
+  function applyProtocolVisibility(stats) {
+    const meshcoreWeek = stats?.meshcore?.week ?? 0;
+    const meshtasticWeek = stats?.meshtastic?.week ?? 0;
+
+    // Hide legend columns for protocols with no activity in the past 7 days.
+    if (meshcoreColEl) meshcoreColEl.style.display = meshcoreWeek === 0 ? 'none' : '';
+    if (meshtasticColEl) meshtasticColEl.style.display = meshtasticWeek === 0 ? 'none' : '';
+
+    // Show protocol toggle buttons only when both protocols have weekly
+    // activity — filtering is pointless when only one protocol is present.
+    const bothActive = meshcoreWeek > 0 && meshtasticWeek > 0;
+    if (protocolToggleMeshcore) protocolToggleMeshcore.hidden = !bothActive;
+    if (protocolToggleMeshtastic) protocolToggleMeshtastic.hidden = !bothActive;
+
+    // Charts is meshtastic-only; hide the nav link when no meshtastic activity.
+    document.querySelectorAll('a[href="/charts"]').forEach(el => {
+      el.style.display = meshtasticWeek === 0 ? 'none' : '';
     });
   }
 
@@ -4466,7 +4859,7 @@ export function initializeApp(config) {
    * Inner closures exposed for unit tests. Production callers should ignore
    * this return value.
    *
-   * @returns {{ _testUtils: { buildMapPopupHtml: Function, normalizeOverlaySource: Function, createAnnouncementEntry: Function, createMessageChatEntry: Function } }}
+   * @returns {{ _testUtils: { buildMapPopupHtml: Function, normalizeOverlaySource: Function, createAnnouncementEntry: Function, createMessageChatEntry: Function, buildDisplayContext: Function, rebuildNodeIndex: Function } }}
    */
   return {
     _testUtils: {
@@ -4474,6 +4867,65 @@ export function initializeApp(config) {
       normalizeOverlaySource,
       createAnnouncementEntry,
       createMessageChatEntry,
+      buildDisplayContext,
+      rebuildNodeIndex,
+      makeRoleFilterKey,
+      normalizeFilterProtocol,
+      matchesRoleFilter,
+      matchesProtocolFilter,
+      buildProtocolIconImg,
+      buildMeshtasticIconImg,
+      buildMeshcoreIconImg,
+      buildRoleButtons,
+      updateLegendRoleFiltersUI,
+      legendClickHandler,
+      activeRoleFilters,
+      hiddenProtocols,
+      legendRoleButtons,
+      legendProtocolButtons,
+      updateTitleCount,
+      updateLegendProtocolCounts,
+      updateFooterStats,
+      applyProtocolVisibility,
+      restartAutoRefresh,
+      updateMetaProtocolToggleUI,
+      adjustStatsForHiddenProtocols,
+      /** Whether auto-refresh is currently paused. */
+      isAutorefreshPaused: () => autorefreshPaused,
+      /** Inject mock count span elements for legend protocol count tests. */
+      _setProtocolCountElements(mc, mt) {
+        meshcoreCountEl = mc;
+        meshtasticCountEl = mt;
+      },
+      /** Inject mock column elements for protocol visibility tests. */
+      _setProtocolColElements(mc, mt) {
+        meshcoreColEl = mc;
+        meshtasticColEl = mt;
+      },
+      /** Trigger a manual refresh cycle (test use only). */
+      refresh,
+      /** Project an original lat/lon + pixel offset into a display LatLng. */
+      projectColocatedOffsetLatLng,
+      /** Re-project every recorded co-located marker (no-op without a map). */
+      refreshColocatedSpiderState,
+      /** rAF-throttled wrapper around the spider refresh. */
+      scheduleColocatedSpiderRefresh,
+      /** Replace the recorded spider state for tests; returns the previous value. */
+      _setColocatedSpiderStateForTests(next) {
+        const previous = colocatedSpiderState;
+        colocatedSpiderState = Array.isArray(next) ? next : [];
+        return previous;
+      },
+      /** Inspect the recorded spider state (test use only). */
+      _getColocatedSpiderStateForTests() {
+        return colocatedSpiderState;
+      },
+      /** Inject a stub Leaflet map for tests that need to drive the projection. */
+      _setMapForTests(stub) {
+        const previous = map;
+        map = stub;
+        return previous;
+      },
     },
   };
 }

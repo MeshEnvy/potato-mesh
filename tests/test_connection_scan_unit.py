@@ -27,7 +27,7 @@ from data.mesh_ingestor.connection_scan import (
     connection_is_ask,
     resolve_connection_ask,
 )
-from data.mesh_ingestor.provider import ConnectionCandidate
+from data.mesh_ingestor.mesh_protocol import ConnectionCandidate
 
 
 def test_connection_is_ask_true_for_variants():

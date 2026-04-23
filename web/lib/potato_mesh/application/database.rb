@@ -17,6 +17,12 @@
 module PotatoMesh
   module App
     module Database
+      # Schema-version marker that gates the one-shot #756 meshcore message
+      # content-dedup backfill.  Stored in SQLite's ``PRAGMA user_version``;
+      # bump this constant when a new one-shot migration is appended and
+      # check the previous value below to decide whether to skip.
+      MESHCORE_CONTENT_DEDUP_BACKFILL_VERSION = 1
+
       # Column definitions required for environment telemetry support. Each
       # entry pairs the column name with the SQL type used when backfilling
       # legacy databases that pre-date the extended telemetry schema.
@@ -136,6 +142,75 @@ module PotatoMesh
             db.execute("ALTER TABLE nodes ADD COLUMN protocol TEXT NOT NULL DEFAULT 'meshtastic'")
             db.execute("UPDATE nodes SET protocol = 'meshtastic' WHERE protocol IS NULL OR TRIM(protocol) = ''")
           end
+
+          unless node_columns.include?("synthetic")
+            db.execute("ALTER TABLE nodes ADD COLUMN synthetic BOOLEAN NOT NULL DEFAULT 0")
+          end
+
+          if node_columns.include?("long_name")
+            existing_indexes = db.execute("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='nodes'").flatten
+            unless existing_indexes.include?("idx_nodes_long_name")
+              db.execute("CREATE INDEX IF NOT EXISTS idx_nodes_long_name ON nodes(long_name)")
+            end
+          end
+
+          # Backfill #747: ensure_unknown_node previously omitted the protocol
+          # column and hardcoded role=CLIENT_HIDDEN, causing meshcore placeholder
+          # nodes to be stored as meshtastic/CLIENT_HIDDEN.  Fix both in one pass.
+          if node_columns.include?("protocol")
+            db.execute("UPDATE nodes SET protocol = 'meshcore' WHERE long_name LIKE 'Meshcore %' AND protocol = 'meshtastic'")
+            db.execute("UPDATE nodes SET role = 'COMPANION' WHERE protocol = 'meshcore' AND role = 'CLIENT_HIDDEN'")
+          end
+
+          # Backfill #755: reconcile meshcore synthetic placeholder rows that
+          # share a long_name with a real (pubkey-derived) meshcore node.
+          # Earlier releases only merged synthetics at real-node upsert time;
+          # if a synthetic arrived after the real was already stored (common
+          # with co-operating ingestors that share this DB), the duplicate
+          # persisted.  Migrate messages to the real id, then drop the stray
+          # synthetic rows.  Idempotent — the EXISTS guards make repeated runs
+          # a no-op.
+          if node_columns.include?("protocol") && node_columns.include?("synthetic")
+            # Only collapse synthetics whose long_name resolves to *exactly*
+            # one real meshcore node.  When two real devices share a
+            # long_name, the placeholder is ambiguous — merging would risk
+            # mis-attributing historical chat messages to the wrong radio.
+            # Wrapped in a single transaction so that a crash between the
+            # UPDATE and DELETE cannot leave messages redirected without the
+            # corresponding synthetic row cleared.
+            db.transaction do
+              db.execute(<<~SQL)
+                UPDATE messages
+                   SET from_id = (
+                     SELECT real.node_id FROM nodes real
+                     JOIN nodes synth ON synth.long_name = real.long_name
+                     WHERE synth.node_id = messages.from_id
+                       AND synth.synthetic = 1 AND synth.protocol = 'meshcore'
+                       AND real.synthetic = 0 AND real.protocol = 'meshcore'
+                     LIMIT 1
+                   )
+                 WHERE from_id IN (
+                   SELECT synth.node_id FROM nodes synth
+                   WHERE synth.synthetic = 1 AND synth.protocol = 'meshcore'
+                     AND (
+                       SELECT COUNT(*) FROM nodes real
+                       WHERE real.long_name = synth.long_name
+                         AND real.synthetic = 0 AND real.protocol = 'meshcore'
+                     ) = 1
+                 )
+              SQL
+              db.execute(<<~SQL)
+                DELETE FROM nodes
+                 WHERE synthetic = 1 AND protocol = 'meshcore'
+                   AND (
+                     SELECT COUNT(*) FROM nodes real
+                     WHERE real.long_name = nodes.long_name
+                       AND real.synthetic = 0 AND real.protocol = 'meshcore'
+                       AND real.node_id != nodes.node_id
+                   ) = 1
+              SQL
+            end
+          end
         end
 
         message_table_exists = db.get_first_value(
@@ -182,6 +257,64 @@ module PotatoMesh
           unless reply_index_exists
             db.execute("CREATE INDEX IF NOT EXISTS idx_messages_reply_id ON messages(reply_id)")
           end
+
+          # #756 — partial index backing the meshcore content-dedup lookup in
+          # insert_message.  Scoped to meshcore so the index stays small even
+          # on meshtastic-heavy deployments.  ``CREATE … IF NOT EXISTS`` is
+          # cheap enough to run on every boot; the one-shot backfill below
+          # is gated separately via ``PRAGMA user_version`` so it does not
+          # repeat after the first successful pass.
+          meshcore_dedup_columns = %w[from_id to_id channel text rx_time protocol]
+          if meshcore_dedup_columns.all? { |column| message_columns.include?(column) }
+            db.execute(<<~SQL)
+              CREATE INDEX IF NOT EXISTS idx_messages_meshcore_content
+                ON messages(from_id, channel, rx_time)
+                WHERE protocol = 'meshcore'
+            SQL
+
+            # #756 backfill — collapse pre-existing meshcore duplicate groups.
+            # Keep the earliest (min rx_time, min id) copy in each
+            # (from_id, to_id, channel, text) cluster where any two rows are
+            # within #{PotatoMesh::App::DataProcessing::MESHCORE_CONTENT_DEDUP_WINDOW_SECONDS} s
+            # of each other.  Window matches the runtime guard so runtime and
+            # backfill behave identically.
+            #
+            # Gated via ``PRAGMA user_version`` so this expensive self-join
+            # runs exactly once after deploy.  Post-fix the runtime guard
+            # prevents new duplicates from accumulating, so re-running on
+            # every boot would scan ``messages`` for no reason.
+            current_version = db.get_first_value("PRAGMA user_version").to_i
+            if current_version < MESHCORE_CONTENT_DEDUP_BACKFILL_VERSION
+              window = PotatoMesh::App::DataProcessing::MESHCORE_CONTENT_DEDUP_WINDOW_SECONDS
+              db.transaction do
+                # Window bound via ``?`` to match the rest of the codebase's
+                # parameter-binding style; the value is a Ruby integer constant
+                # so SQL-injection was never at risk here — the switch is
+                # purely for consistency.  ``PRAGMA user_version`` cannot
+                # accept bind params, so it keeps literal interpolation of
+                # an internal constant.
+                db.execute(<<~SQL, [window])
+                  DELETE FROM messages
+                   WHERE protocol = 'meshcore'
+                     AND text IS NOT NULL AND text != ''
+                     AND from_id IS NOT NULL
+                     AND EXISTS (
+                       SELECT 1 FROM messages AS earlier
+                        WHERE earlier.protocol = 'meshcore'
+                          AND earlier.from_id = messages.from_id
+                          AND earlier.to_id IS messages.to_id
+                          AND earlier.channel IS messages.channel
+                          AND earlier.text = messages.text
+                          AND messages.rx_time - earlier.rx_time >= 0
+                          AND messages.rx_time - earlier.rx_time <= ?
+                          AND (earlier.rx_time < messages.rx_time
+                               OR earlier.id < messages.id)
+                     )
+                SQL
+                db.execute("PRAGMA user_version = #{MESHCORE_CONTENT_DEDUP_BACKFILL_VERSION}")
+              end
+            end
+          end
         end
 
         tables = db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='instances'").flatten
@@ -198,6 +331,17 @@ module PotatoMesh
 
         unless instance_columns.include?("nodes_count")
           db.execute("ALTER TABLE instances ADD COLUMN nodes_count INTEGER")
+          instance_columns << "nodes_count"
+        end
+
+        unless instance_columns.include?("meshcore_nodes_count")
+          db.execute("ALTER TABLE instances ADD COLUMN meshcore_nodes_count INTEGER")
+          instance_columns << "meshcore_nodes_count"
+        end
+
+        unless instance_columns.include?("meshtastic_nodes_count")
+          db.execute("ALTER TABLE instances ADD COLUMN meshtastic_nodes_count INTEGER")
+          instance_columns << "meshtastic_nodes_count"
         end
 
         telemetry_tables =

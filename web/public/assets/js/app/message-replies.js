@@ -262,21 +262,79 @@ export function resolveReplyPrefix({
 /**
  * Normalise an emoji candidate into a trimmed string.
  *
+ * Numeric values above 127 are treated as Unicode codepoints and converted to
+ * the corresponding character (e.g. ``128077`` → ``"👍"``).  Small values
+ * (≤ 127) are kept as digit strings so that slot markers like ``"1"`` pass
+ * through unchanged.
+ *
  * @param {*} value Emoji candidate.
  * @returns {?string} Emoji string when valid.
  */
-function normaliseEmojiValue(value) {
+export function normaliseEmojiValue(value) {
   if (value == null) return null;
   if (typeof value === 'string') {
     const trimmed = value.trim();
-    return trimmed.length > 0 ? trimmed : null;
+    if (!trimmed) return null;
+    if (/^\d+$/.test(trimmed)) {
+      const cp = Number(trimmed);
+      if (cp > 127 && Number.isFinite(cp)) {
+        try { return String.fromCodePoint(cp); } catch { /* fall through */ }
+      }
+    }
+    return trimmed;
   }
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) return null;
+    if (value > 127) {
+      try { return String.fromCodePoint(value); } catch { /* fall through */ }
+    }
     return String(value);
   }
   const str = String(value).trim();
   return str.length > 0 ? str : null;
+}
+
+/**
+ * Maximum Unicode codepoint length for text that may still qualify as a
+ * reaction placeholder.  A bare emoji (single grapheme) is at most 2
+ * codepoints — base character plus an optional variation selector
+ * (U+FE0F).  Multi-codepoint ZWJ families (👨‍👩‍👧, 🏳️‍🌈) are intentionally
+ * NOT accepted here: matching them would also let through short CJK
+ * messages like "你好世界吗" (5 codepoints, no ASCII letters), causing real
+ * prose to be misclassified as a reaction.
+ *
+ * MUST stay aligned with the Python ingestor's
+ * ``_REACTION_PLACEHOLDER_MAX_CODEPOINTS`` (``handlers/generic.py``);
+ * changing one side without the other re-introduces ingest/render
+ * disagreement (a packet stored as a reaction but rendered as text, or
+ * vice versa).
+ *
+ * @type {number}
+ */
+const REACTION_PLACEHOLDER_MAX_CODEPOINTS = 2;
+
+/**
+ * Return whether ``text`` looks like a reaction placeholder rather than
+ * substantive message content.
+ *
+ * Reaction packets carry either no text, a small numeric count/slot marker
+ * (e.g. ``"1"``, ``"3"``), or occasionally a bare emoji.  Anything that reads
+ * as real prose should cause the message to be classified as a regular text
+ * message, not a reaction.
+ *
+ * @param {?string} text Trimmed message text (may be ``null``).
+ * @returns {boolean} ``true`` when *text* is absent or a placeholder.
+ */
+function isReactionPlaceholderText(text) {
+  if (!text) return true;
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+  if (/^\d+$/.test(trimmed)) return true;
+  // Bare emoji heuristic — see REACTION_PLACEHOLDER_MAX_CODEPOINTS.
+  if ([...trimmed].length <= REACTION_PLACEHOLDER_MAX_CODEPOINTS && !/[a-zA-Z]/.test(trimmed)) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -299,7 +357,11 @@ function isReactionMessage(message) {
     return false;
   }
   const hasReplyId = message.reply_id != null || message.replyId != null;
-  return hasReplyId || !!portnum;
+  if (!hasReplyId) {
+    return false;
+  }
+  const text = toTrimmedString(message.text);
+  return isReactionPlaceholderText(text);
 }
 
 /**
@@ -339,27 +401,109 @@ function resolveMessageTextSegment(message, isReaction) {
 }
 
 /**
+ * Regex with a single capturing group that matches http:// and https:// URLs.
+ * Used by {@link renderLiteralWithLinks} to split text into URL and non-URL
+ * segments while preserving the matched URL in the resulting array.
+ * @type {RegExp}
+ */
+const URL_SPLIT_PATTERN = /(https?:\/\/[^\s<>"'[\]]{1,2048})/;
+
+/**
+ * Strip trailing punctuation characters that are typically sentence
+ * delimiters rather than part of a URL (e.g. a period at end of sentence).
+ *
+ * @param {string} url Raw URL candidate.
+ * @returns {string} URL with trailing punctuation trimmed.
+ */
+function trimUrlTrailingPunctuation(url) {
+  return url.replace(/[.,;!?)]+$/, '');
+}
+
+/**
+ * Render a single raw text segment, converting any ``http://`` or
+ * ``https://`` URLs into ``<a>`` elements that open in a new tab.
+ * Non-URL text is passed through ``escapeHtml`` unchanged.
+ *
+ * @param {string} text Raw (unescaped) literal text.
+ * @param {Function} escapeHtml HTML-escape function.
+ * @returns {string} Safe HTML with URLs wrapped in anchor elements.
+ */
+export function renderLiteralWithLinks(text, escapeHtml) {
+  // split() with a capturing group interleaves plain text (even indices)
+  // and matched URLs (odd indices): ["before", "https://x", " after", ...]
+  const parts = text.split(URL_SPLIT_PATTERN);
+  return parts.map((part, i) => {
+    if (i % 2 === 0) {
+      return part ? escapeHtml(part) : '';
+    }
+    // URL segment — strip trailing punctuation then linkify.
+    const url = trimUrlTrailingPunctuation(part);
+    const trailing = part.slice(url.length);
+    return `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>${trailing ? escapeHtml(trailing) : ''}`;
+  }).join('');
+}
+
+/**
+ * Render a text segment, replacing ``@[Name]`` mention patterns with the
+ * output of ``renderMentionHtml`` when provided.  Literal text segments are
+ * passed through {@link renderLiteralWithLinks} so that URLs become clickable.
+ *
+ * When ``renderMentionHtml`` is ``null`` the function is equivalent to
+ * calling {@link renderLiteralWithLinks} on the whole string.
+ *
+ * @param {string} text Raw message text segment.
+ * @param {Function} escapeHtml HTML-escape function.
+ * @param {Function|null} renderMentionHtml Called with the mention name (the
+ *   string between ``@[`` and ``]``); should return an HTML snippet.
+ * @returns {string} HTML string safe for insertion into the DOM.
+ */
+function renderTextWithMentions(text, escapeHtml, renderMentionHtml) {
+  if (typeof renderMentionHtml !== 'function') return renderLiteralWithLinks(text, escapeHtml);
+  // split() with a capturing group interleaves literal segments (even indices)
+  // and captured mention names (odd indices): ["before", "Alice", "after", ...]
+  const parts = text.split(/@\[([^\]]+)\]/);
+  return parts.map((part, i) => {
+    // Mention names are trimmed before being passed to the callback so that
+    // captures like "@[ Timo +]" or "@[T-deck NK ]" (with stray whitespace)
+    // resolve against the registry; the callback is responsible for falling
+    // back to a plain-text rendering when the name does not match.
+    if (i % 2 === 1) return renderMentionHtml(part.trim());
+    // Empty literal segments (e.g. when a mention is at the start or end) can
+    // be skipped to avoid unnecessary renderLiteralWithLinks calls.
+    return part ? renderLiteralWithLinks(part, escapeHtml) : '';
+  }).join('');
+}
+
+/**
  * Build the rendered message body containing text and optional emoji.
+ * ``http://`` and ``https://`` URLs in the message text are automatically
+ * converted to ``<a>`` elements that open in a new tab.
  *
  * @param {{
  *   message: Object,
  *   escapeHtml: Function,
- *   renderEmojiHtml: Function
- * }} params Rendering dependencies.
+ *   renderEmojiHtml: Function,
+ *   renderMentionHtml?: Function|null
+ * }} params Rendering dependencies.  When ``renderMentionHtml`` is provided it
+ *   is called for each ``@[Name]`` mention found in the message text so the
+ *   caller can substitute a badge or link in place of the raw mention string.
  * @returns {string} HTML snippet describing the message body.
  */
-export function buildMessageBody({ message, escapeHtml, renderEmojiHtml }) {
+export function buildMessageBody({ message, escapeHtml, renderEmojiHtml, renderMentionHtml = null }) {
   if (typeof escapeHtml !== 'function') {
     throw new TypeError('escapeHtml must be a function');
   }
   if (typeof renderEmojiHtml !== 'function') {
     throw new TypeError('renderEmojiHtml must be a function');
   }
+  if (renderMentionHtml !== null && typeof renderMentionHtml !== 'function') {
+    throw new TypeError('renderMentionHtml must be a function when provided');
+  }
   if (!message || typeof message !== 'object') {
     return '';
   }
 
- const segments = [];
+  const segments = [];
   const reaction = isReactionMessage(message);
   const textSegment = resolveMessageTextSegment(message, reaction);
   const reactionCount = reaction && textSegment && /^×\d+$/.test(textSegment) ? textSegment : null;
@@ -368,7 +512,7 @@ export function buildMessageBody({ message, escapeHtml, renderEmojiHtml }) {
   let reactionEmoji = reaction && !emojiIsNumericPlaceholder ? emoji : null;
 
   if (!reaction && textSegment) {
-    segments.push(escapeHtml(textSegment));
+    segments.push(renderTextWithMentions(textSegment, escapeHtml, renderMentionHtml));
   }
 
   if (reaction) {

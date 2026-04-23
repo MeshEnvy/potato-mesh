@@ -261,6 +261,8 @@ def _configure_common_defaults(
 ):
     """Set fast configuration defaults shared by daemon integration tests."""
 
+    monkeypatch.setattr(daemon.config, "INSTANCES", (("http://test", ""),))
+    monkeypatch.setattr(daemon.config, "INSTANCE", "http://test")
     monkeypatch.setattr(daemon.config, "SNAPSHOT_SECS", 0)
     monkeypatch.setattr(daemon.config, "_RECONNECT_INITIAL_DELAY_SECS", 0)
     monkeypatch.setattr(daemon.config, "_RECONNECT_MAX_DELAY_SECS", 0)
@@ -828,7 +830,7 @@ def test_loop_iteration_full_pass_returns_false(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# PROVIDER env-var selection
+# PROTOCOL env-var selection
 # ---------------------------------------------------------------------------
 
 
@@ -894,12 +896,12 @@ def _reload_config() -> types.ModuleType:
 
 
 @pytest.fixture()
-def reset_provider_config():
-    """Reload config after the test so PROVIDER changes don't leak across tests."""
+def reset_protocol_config():
+    """Reload config after the test so PROTOCOL changes don't leak across tests."""
     yield
     import os
 
-    os.environ.pop("PROVIDER", None)
+    os.environ.pop("PROTOCOL", None)
     _reload_config()
 
 
@@ -910,33 +912,34 @@ def reset_provider_config():
         ("meshcore", "meshcore"),
     ],
 )
-def test_config_provider_env(monkeypatch, reset_provider_config, env_value, expected):
-    """PROVIDER env var selects the provider; absent defaults to 'meshtastic'."""
+def test_config_protocol_env(monkeypatch, reset_protocol_config, env_value, expected):
+    """PROTOCOL env var selects the protocol; absent defaults to 'meshtastic'."""
     if env_value is None:
-        monkeypatch.delenv("PROVIDER", raising=False)
+        monkeypatch.delenv("PROTOCOL", raising=False)
     else:
-        monkeypatch.setenv("PROVIDER", env_value)
-    assert _reload_config().PROVIDER == expected
+        monkeypatch.setenv("PROTOCOL", env_value)
+    cfg = _reload_config()
+    assert cfg.PROTOCOL == expected
 
 
-def test_config_provider_unknown_raises(monkeypatch, reset_provider_config):
-    """An unrecognised PROVIDER value must raise ValueError at import time."""
-    monkeypatch.setenv("PROVIDER", "reticulum")
-    with pytest.raises(ValueError, match="PROVIDER"):
+def test_config_protocol_unknown_raises(monkeypatch, reset_protocol_config):
+    """An unrecognised PROTOCOL value must raise ValueError at import time."""
+    monkeypatch.setenv("PROTOCOL", "reticulum")
+    with pytest.raises(ValueError, match="PROTOCOL"):
         _reload_config()
 
 
 @pytest.mark.parametrize(
     "provider_name, module_path, class_name",
     [
-        ("meshtastic", "data.mesh_ingestor.providers.meshtastic", "MeshtasticProvider"),
-        ("meshcore", "data.mesh_ingestor.providers.meshcore", "MeshcoreProvider"),
+        ("meshtastic", "data.mesh_ingestor.protocols.meshtastic", "MeshtasticProvider"),
+        ("meshcore", "data.mesh_ingestor.protocols.meshcore", "MeshcoreProvider"),
     ],
 )
 def test_daemon_main_selects_provider(
     monkeypatch, provider_name, module_path, class_name
 ):
-    """main() must instantiate the correct provider class based on PROVIDER."""
+    """main() must instantiate the correct protocol class based on PROTOCOL."""
     mod = importlib.import_module(module_path)
     instantiated = []
 
@@ -946,7 +949,7 @@ def test_daemon_main_selects_provider(
         return p
 
     _patch_daemon_for_fast_exit(monkeypatch)
-    monkeypatch.setattr(daemon.config, "PROVIDER", provider_name)
+    monkeypatch.setattr(daemon.config, "PROTOCOL", provider_name)
     monkeypatch.setattr(mod, class_name, make_provider)
 
     daemon.main()
@@ -1089,3 +1092,357 @@ def test_check_inactivity_reconnect_elapsed_triggers(monkeypatch):
     # latest_activity = iface_connected_at(0.0); elapsed = 100s > 30s → trigger
     result = daemon._check_inactivity_reconnect(state)
     assert result is True
+
+
+def test_inactivity_reconnect_bypasses_throttle_when_explicitly_disconnected(
+    monkeypatch,
+):
+    """Explicit disconnect reconnects even when last_inactivity_reconnect is recent.
+
+    When isConnected reports False the daemon must not wait the full
+    inactivity window before reconnecting.  It uses the shorter
+    _RECONNECT_MAX_DELAY_SECS window instead.
+    """
+    state = _make_state(inactivity_reconnect_secs=3600.0)
+    state.iface = DummyInterface(is_connected=False)
+    state.iface_connected_at = 0.0
+    # 61 seconds since last reconnect attempt — outside the 60 s anti-thrash window.
+    state.last_inactivity_reconnect = 3589.0
+
+    monkeypatch.setattr(daemon.time, "monotonic", lambda: 3650.0)
+    monkeypatch.setattr(daemon.handlers, "last_packet_monotonic", lambda: None)
+    monkeypatch.setattr(daemon.config, "_RECONNECT_MAX_DELAY_SECS", 60.0)
+    monkeypatch.setattr(daemon.config, "_debug_log", lambda *_a, **_k: None)
+    monkeypatch.setattr(daemon, "_close_interface", lambda iface: None)
+
+    result = daemon._check_inactivity_reconnect(state)
+    assert (
+        result is True
+    ), "Expected reconnect to fire when explicitly disconnected and 61s have elapsed"
+
+
+def test_inactivity_reconnect_still_throttles_inactivity(monkeypatch):
+    """The full inactivity window still throttles reconnects that are not explicit disconnects."""
+    state = _make_state(inactivity_reconnect_secs=3600.0)
+    # isConnected=True → inactivity-only trigger (no explicit disconnect signal)
+    state.iface = DummyInterface(is_connected=True)
+    state.iface_connected_at = 0.0
+    # now=3700, last_inactivity_reconnect=3691 → 9 s elapsed, well within 3600 s window.
+    state.last_inactivity_reconnect = 3691.0
+
+    monkeypatch.setattr(daemon.time, "monotonic", lambda: 3700.0)
+    # No recent packet → inactivity_elapsed = 3700 s > inactivity_reconnect_secs (3600 s)
+    monkeypatch.setattr(daemon.handlers, "last_packet_monotonic", lambda: None)
+    monkeypatch.setattr(daemon.config, "_RECONNECT_MAX_DELAY_SECS", 60.0)
+
+    # Even though enough inactive time has passed, last_inactivity_reconnect is
+    # only 9 s ago (< 3600 s throttle window) → reconnect is suppressed.
+    result = daemon._check_inactivity_reconnect(state)
+    assert (
+        result is False
+    ), "Expected throttle to suppress reconnect when last attempt was 9 s ago"
+
+
+def test_inactivity_reconnect_logs_queue_depth(monkeypatch):
+    """The inactivity reconnect debug log includes the current queue depth."""
+    state = _make_state(inactivity_reconnect_secs=30.0)
+    state.iface = DummyInterface(is_connected=True)
+    state.iface_connected_at = 0.0
+    state.last_inactivity_reconnect = None
+
+    monkeypatch.setattr(daemon.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(daemon.handlers, "last_packet_monotonic", lambda: None)
+    monkeypatch.setattr(daemon, "_close_interface", lambda iface: None)
+
+    # Seed the global queue with two dummy items so queue_depth is non-zero.
+    from data.mesh_ingestor.queue import STATE, _enqueue_post_json
+
+    _enqueue_post_json("/api/a", {}, 10, state=STATE)
+    _enqueue_post_json("/api/b", {}, 20, state=STATE)
+
+    log_kwargs: list[dict] = []
+    monkeypatch.setattr(
+        daemon.config,
+        "_debug_log",
+        lambda msg, **kw: log_kwargs.append(kw),
+    )
+
+    try:
+        result = daemon._check_inactivity_reconnect(state)
+        assert result is True
+        assert any(
+            kw.get("queue_depth") == 2 for kw in log_kwargs
+        ), f"Expected queue_depth=2 in log kwargs, got {log_kwargs}"
+    finally:
+        # Clean up global state so other tests are not affected.
+        STATE.queue.clear()
+
+
+def test_main_exits_early_when_no_instances(monkeypatch):
+    """main() returns immediately when no INSTANCE_DOMAIN is configured.
+
+    The queue drainer must NOT be started on the early-exit path.
+    """
+    monkeypatch.setattr(daemon.config, "INSTANCES", ())
+    monkeypatch.setattr(daemon.config, "INSTANCE", "")
+    log_msgs: list[str] = []
+    monkeypatch.setattr(
+        daemon.config,
+        "_debug_log",
+        lambda msg, **kw: log_msgs.append(msg),
+    )
+    drainer_calls: list[object] = []
+    monkeypatch.setattr(
+        daemon.queue,
+        "_start_queue_drainer",
+        lambda state=None: drainer_calls.append(state),
+    )
+
+    provider = _make_minimal_fake_provider("meshtastic")
+    daemon.main(provider=provider)
+
+    assert any("no instance_domain" in m.lower() for m in log_msgs)
+    assert drainer_calls == [], "Drainer must not start when no instances configured"
+
+
+def test_main_starts_queue_drainer(monkeypatch):
+    """main() calls queue._start_queue_drainer after subscribing."""
+    drainer_calls: list[object] = []
+    monkeypatch.setattr(
+        daemon.queue,
+        "_start_queue_drainer",
+        lambda state=None: drainer_calls.append(state),
+    )
+
+    _patch_daemon_for_fast_exit(monkeypatch)
+    provider = _make_minimal_fake_provider("meshtastic")
+    daemon.main(provider=provider)
+
+    assert len(drainer_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# _try_send_self_node
+# ---------------------------------------------------------------------------
+
+
+def test_try_send_self_node_skips_when_no_method():
+    """_try_send_self_node does nothing when provider has no self_node_item."""
+
+    class _NoSelfNode:
+        pass
+
+    state = _make_state()
+    state.provider = _NoSelfNode()  # type: ignore[assignment]
+    state.iface = DummyInterface()
+    # Should not raise; last_self_node_report stays None.
+    daemon._try_send_self_node(state)
+    assert state.last_self_node_report is None
+
+
+def test_try_send_self_node_skips_when_item_is_none(monkeypatch):
+    """_try_send_self_node does nothing when self_node_item returns None."""
+
+    class _NullSelfNode:
+        def self_node_item(self, iface):
+            return None
+
+    upserted = []
+    monkeypatch.setattr(
+        daemon.handlers, "upsert_node", lambda nid, n: upserted.append(nid)
+    )
+
+    state = _make_state()
+    state.provider = _NullSelfNode()  # type: ignore[assignment]
+    state.iface = DummyInterface()
+    daemon._try_send_self_node(state)
+
+    assert upserted == []
+    assert state.last_self_node_report is None
+
+
+def test_try_send_self_node_calls_upsert_and_sets_timestamp(monkeypatch):
+    """_try_send_self_node upserts the self-node and records the timestamp."""
+
+    class _GoodSelfNode:
+        def self_node_item(self, iface):
+            return "!aabbccdd", {"user": {"longName": "Host"}}
+
+    upserted = []
+    monkeypatch.setattr(
+        daemon.handlers, "upsert_node", lambda nid, n: upserted.append(nid)
+    )
+    monkeypatch.setattr(daemon.config, "_debug_log", lambda *_a, **_k: None)
+    fixed_time = 5000.0
+    monkeypatch.setattr(daemon.time, "monotonic", lambda: fixed_time)
+
+    state = _make_state()
+    state.provider = _GoodSelfNode()  # type: ignore[assignment]
+    state.iface = DummyInterface()
+    daemon._try_send_self_node(state)
+
+    assert upserted == ["!aabbccdd"]
+    assert state.last_self_node_report == fixed_time
+
+
+def test_try_send_self_node_upsert_error_suppressed(monkeypatch):
+    """_try_send_self_node suppresses upsert errors and does not update timestamp."""
+
+    class _GoodSelfNode:
+        def self_node_item(self, iface):
+            return "!aabbccdd", {}
+
+    def _raise(*_a, **_k):
+        raise RuntimeError("network error")
+
+    monkeypatch.setattr(daemon.handlers, "upsert_node", _raise)
+    logged = []
+    monkeypatch.setattr(daemon.config, "_debug_log", lambda *a, **kw: logged.append(kw))
+
+    state = _make_state()
+    state.provider = _GoodSelfNode()  # type: ignore[assignment]
+    state.iface = DummyInterface()
+    # Must not raise.
+    daemon._try_send_self_node(state)
+
+    assert state.last_self_node_report is None
+    assert any(c.get("context") == "daemon.self_node" for c in logged)
+
+
+def test_try_send_self_node_self_node_item_error_suppressed(monkeypatch):
+    """_try_send_self_node suppresses errors raised by self_node_item itself."""
+
+    class _BrokenSelfNode:
+        def self_node_item(self, iface):
+            raise RuntimeError("provider error")
+
+    logged = []
+    monkeypatch.setattr(daemon.config, "_debug_log", lambda *a, **kw: logged.append(kw))
+
+    state = _make_state()
+    state.provider = _BrokenSelfNode()  # type: ignore[assignment]
+    state.iface = DummyInterface()
+    # Must not raise.
+    daemon._try_send_self_node(state)
+
+    assert state.last_self_node_report is None
+    assert any(c.get("context") == "daemon.self_node" for c in logged)
+
+
+# ---------------------------------------------------------------------------
+# _loop_iteration — periodic self-node report
+# ---------------------------------------------------------------------------
+
+
+def _make_self_node_provider(node_item=("!aabbccdd", {"user": {}})):
+    """Return a minimal provider stub that exposes ``self_node_item``."""
+
+    class _SelfNodeProvider:
+        name = "test"
+
+        def subscribe(self):
+            return []
+
+        def node_snapshot_items(self, iface):
+            return []
+
+        def self_node_item(self, iface):
+            return node_item
+
+    return _SelfNodeProvider()
+
+
+def _patch_loop_iteration_common(monkeypatch, *, now=100.0):
+    """Apply monkeypatches shared by all _loop_iteration self-node tests."""
+    monkeypatch.setattr(daemon.handlers, "last_packet_monotonic", lambda: None)
+    monkeypatch.setattr(daemon.config, "_debug_log", lambda *_a, **_k: None)
+    monkeypatch.setattr(daemon.config, "_SELF_NODE_REPORT_INTERVAL_SECS", 3600.0)
+    monkeypatch.setattr(daemon.time, "monotonic", lambda: now)
+    monkeypatch.setattr(
+        daemon,
+        "_process_ingestor_heartbeat",
+        lambda iface, **kw: kw.get("ingestor_announcement_sent", False),
+    )
+
+
+def test_loop_iteration_triggers_self_node_report_immediately_after_snapshot(
+    monkeypatch,
+):
+    """Self-node report fires on the first iteration after the initial snapshot."""
+    upserted = []
+    monkeypatch.setattr(
+        daemon.handlers, "upsert_node", lambda nid, n: upserted.append(nid)
+    )
+    _patch_loop_iteration_common(monkeypatch)
+
+    state = _make_state()
+    state.iface = DummyInterface()
+    state.provider = _make_self_node_provider()  # type: ignore[assignment]
+    state.initial_snapshot_sent = True
+    state.last_self_node_report = None  # never reported before
+
+    daemon._loop_iteration(state)
+
+    assert "!aabbccdd" in upserted
+
+
+def test_loop_iteration_self_node_not_triggered_before_snapshot(monkeypatch):
+    """Self-node report is NOT triggered before the initial snapshot is sent."""
+    upserted = []
+    monkeypatch.setattr(
+        daemon.handlers, "upsert_node", lambda nid, n: upserted.append(nid)
+    )
+    _patch_loop_iteration_common(monkeypatch)
+
+    state = _make_state()
+    state.iface = DummyInterface()
+    state.provider = _make_self_node_provider()  # type: ignore[assignment]
+    state.initial_snapshot_sent = False  # snapshot not yet sent
+
+    # _loop_iteration will attempt _try_connect because iface is set but
+    # initial_snapshot_sent is False — prevent real connect by patching snapshot
+    monkeypatch.setattr(daemon, "_try_send_snapshot", lambda s: True)
+
+    daemon._loop_iteration(state)
+
+    assert "!aabbccdd" not in upserted
+
+
+def test_loop_iteration_self_node_not_retried_within_interval(monkeypatch):
+    """Self-node report is NOT re-fired within the throttle interval."""
+    upserted = []
+    monkeypatch.setattr(
+        daemon.handlers, "upsert_node", lambda nid, n: upserted.append(nid)
+    )
+    _patch_loop_iteration_common(monkeypatch, now=100.0)
+
+    state = _make_state()
+    state.iface = DummyInterface()
+    state.provider = _make_self_node_provider()  # type: ignore[assignment]
+    state.initial_snapshot_sent = True
+    # Simulate a recent report: 100 - 50 = 50 seconds ago < 3600 interval
+    state.last_self_node_report = 50.0
+
+    daemon._loop_iteration(state)
+
+    assert "!aabbccdd" not in upserted
+
+
+def test_loop_iteration_self_node_retried_after_interval(monkeypatch):
+    """Self-node report fires again after the full interval has elapsed."""
+    upserted = []
+    monkeypatch.setattr(
+        daemon.handlers, "upsert_node", lambda nid, n: upserted.append(nid)
+    )
+    # now=5000; last_report=1000; elapsed=4000 > 3600 → should fire
+    _patch_loop_iteration_common(monkeypatch, now=5000.0)
+
+    state = _make_state()
+    state.iface = DummyInterface()
+    state.provider = _make_self_node_provider()  # type: ignore[assignment]
+    state.initial_snapshot_sent = True
+    state.last_self_node_report = 1000.0  # 4000 seconds ago
+
+    daemon._loop_iteration(state)
+
+    assert "!aabbccdd" in upserted

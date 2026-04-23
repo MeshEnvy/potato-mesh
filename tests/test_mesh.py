@@ -228,13 +228,14 @@ def mesh_module(monkeypatch):
 
 
 def test_instance_domain_prefers_primary_env(mesh_module, monkeypatch):
-    """Ensure the ingestor prefers ``INSTANCE_DOMAIN`` over the legacy variable."""
+    """Ensure the ingestor reads ``INSTANCE_DOMAIN``."""
 
     monkeypatch.setenv("INSTANCE_DOMAIN", "https://new.example")
-    monkeypatch.setenv("POTATOMESH_INSTANCE", "https://legacy.example")
 
     try:
+        refreshed_instances = mesh_module.config._resolve_instance_domains()
         refreshed_instance = mesh_module.config._resolve_instance_domain()
+        mesh_module.config.INSTANCES = refreshed_instances
         mesh_module.config.INSTANCE = refreshed_instance
         mesh_module.INSTANCE = refreshed_instance
 
@@ -242,26 +243,7 @@ def test_instance_domain_prefers_primary_env(mesh_module, monkeypatch):
         assert mesh_module.INSTANCE == "https://new.example"
     finally:
         monkeypatch.delenv("INSTANCE_DOMAIN", raising=False)
-        monkeypatch.delenv("POTATOMESH_INSTANCE", raising=False)
-        mesh_module.config.INSTANCE = mesh_module.config._resolve_instance_domain()
-        mesh_module.INSTANCE = mesh_module.config.INSTANCE
-
-
-def test_instance_domain_falls_back_to_legacy(mesh_module, monkeypatch):
-    """Verify ``POTATOMESH_INSTANCE`` is used when ``INSTANCE_DOMAIN`` is unset."""
-
-    monkeypatch.delenv("INSTANCE_DOMAIN", raising=False)
-    monkeypatch.setenv("POTATOMESH_INSTANCE", "https://legacy-only.example")
-
-    try:
-        refreshed_instance = mesh_module.config._resolve_instance_domain()
-        mesh_module.config.INSTANCE = refreshed_instance
-        mesh_module.INSTANCE = refreshed_instance
-
-        assert refreshed_instance == "https://legacy-only.example"
-        assert mesh_module.INSTANCE == "https://legacy-only.example"
-    finally:
-        monkeypatch.delenv("POTATOMESH_INSTANCE", raising=False)
+        mesh_module.config.INSTANCES = mesh_module.config._resolve_instance_domains()
         mesh_module.config.INSTANCE = mesh_module.config._resolve_instance_domain()
         mesh_module.INSTANCE = mesh_module.config.INSTANCE
 
@@ -270,10 +252,11 @@ def test_instance_domain_infers_scheme_for_hostnames(mesh_module, monkeypatch):
     """Ensure bare hostnames are promoted to HTTPS URLs for ingestion."""
 
     monkeypatch.setenv("INSTANCE_DOMAIN", "mesh.example.org")
-    monkeypatch.delenv("POTATOMESH_INSTANCE", raising=False)
 
     try:
+        refreshed_instances = mesh_module.config._resolve_instance_domains()
         refreshed_instance = mesh_module.config._resolve_instance_domain()
+        mesh_module.config.INSTANCES = refreshed_instances
         mesh_module.config.INSTANCE = refreshed_instance
         mesh_module.INSTANCE = refreshed_instance
 
@@ -281,6 +264,7 @@ def test_instance_domain_infers_scheme_for_hostnames(mesh_module, monkeypatch):
         assert mesh_module.INSTANCE == "https://mesh.example.org"
     finally:
         monkeypatch.delenv("INSTANCE_DOMAIN", raising=False)
+        mesh_module.config.INSTANCES = mesh_module.config._resolve_instance_domains()
         mesh_module.config.INSTANCE = mesh_module.config._resolve_instance_domain()
         mesh_module.INSTANCE = mesh_module.config.INSTANCE
 
@@ -605,10 +589,10 @@ def test_ensure_radio_metadata_extracts_config(mesh_module, capsys):
     first_log = capsys.readouterr().out
 
     assert iface.wait_calls == 1
-    assert mesh.config.LORA_FREQ == 868
+    assert mesh.config.LORA_FREQ == 869
     assert mesh.config.MODEM_PRESET == "MediumFast"
     assert "Captured LoRa radio metadata" in first_log
-    assert "lora_freq=868" in first_log
+    assert "lora_freq=869" in first_log
     assert "modem_preset='MediumFast'" in first_log
 
     secondary_lora = make_lora(7, "US_915", 2, "LONG_FAST", preset_field="preset")
@@ -618,7 +602,7 @@ def test_ensure_radio_metadata_extracts_config(mesh_module, capsys):
     second_log = capsys.readouterr().out
 
     assert second_iface.wait_calls == 1
-    assert mesh.config.LORA_FREQ == 868
+    assert mesh.config.LORA_FREQ == 869
     assert mesh.config.MODEM_PRESET == "MediumFast"
     assert second_log == ""
 
@@ -868,6 +852,73 @@ def test_store_packet_dict_posts_reaction_message(mesh_module, monkeypatch):
     assert payload["rx_time"] == 1_700_100_000
     assert payload["rx_iso"] == mesh._iso(1_700_100_000)
     assert priority == mesh._MESSAGE_POST_PRIORITY
+
+
+def test_store_packet_dict_text_with_reply_and_emoji_is_not_reaction(
+    mesh_module, monkeypatch
+):
+    """Regression test for #699: a TEXT_MESSAGE_APP packet that carries both
+    a ``reply_id`` and an ``emoji`` AND substantial body text must be ingested
+    as a regular text message — not silently reclassified as a reaction.
+
+    This pins the end-to-end ingest contract: the helper's classification
+    (``_is_likely_reaction``), the captured POST payload, and the preserved
+    text/emoji/reply_id fields must all agree that this is text, not a
+    reaction.
+    """
+
+    mesh = mesh_module
+    captured = []
+    monkeypatch.setattr(
+        mesh,
+        "_queue_post_json",
+        lambda path, payload, *, priority: captured.append((path, payload, priority)),
+    )
+
+    packet = {
+        "id": 4242,
+        "rxTime": 1_700_200_000,
+        "fromId": "!sender",
+        "toId": "^all",
+        "channel": 1,  # non-primary channel: bypass DM filter regardless
+        "decoded": {
+            "portnum": "TEXT_MESSAGE_APP",
+            "text": "Great job! \U0001f44d",
+            "data": {
+                "reply_id": "7029",
+                "emoji": "\U0001f44d",
+            },
+        },
+    }
+
+    mesh.store_packet_dict(packet)
+
+    # 1. The packet was posted (not dropped) ---------------------------------
+    assert captured, "Expected POST for text message with reply_id+emoji"
+    path, payload, _ = captured[0]
+    assert path == "/api/messages"
+
+    # 2. Substantial text is preserved verbatim ------------------------------
+    assert payload["text"] == "Great job! \U0001f44d"
+    assert payload["emoji"] == "\U0001f44d"
+    assert payload["reply_id"] == 7029
+    assert payload["portnum"] == "TEXT_MESSAGE_APP"
+
+    # 3. The classification helper agrees this is NOT a reaction -------------
+    # (Pinning helper + ingest pipeline together prevents future drift where
+    # one layer changes its mind without the other.)
+    from data.mesh_ingestor.handlers.generic import _is_likely_reaction
+
+    assert (
+        _is_likely_reaction(
+            "TEXT_MESSAGE_APP",
+            1,
+            7029,
+            "\U0001f44d",
+            "Great job! \U0001f44d",
+        )
+        is False
+    )
 
 
 def test_store_packet_dict_posts_position(mesh_module, monkeypatch):
@@ -1637,7 +1688,9 @@ def test_main_retries_interface_creation(mesh_module, monkeypatch):
             raise RuntimeError("boom")
         return iface, port
 
-    monkeypatch.setattr(mesh, "PORT", "/dev/ttyTEST")
+    monkeypatch.setattr(mesh, "INSTANCES", (("http://test", ""),))
+    monkeypatch.setattr(mesh, "INSTANCE", "http://test")
+    monkeypatch.setattr(mesh, "CONNECTION", "/dev/ttyTEST")
     monkeypatch.setattr(mesh, "_create_serial_interface", fake_create)
     monkeypatch.setattr(mesh.threading, "Event", DummyEvent)
     monkeypatch.setattr(mesh.signal, "signal", lambda *_, **__: None)
@@ -1709,7 +1762,9 @@ def test_main_reconnects_when_connection_event_clears(mesh_module, monkeypatch):
             self._flag = True
             return True
 
-    monkeypatch.setattr(mesh, "PORT", "/dev/ttyTEST")
+    monkeypatch.setattr(mesh, "INSTANCES", (("http://test", ""),))
+    monkeypatch.setattr(mesh, "INSTANCE", "http://test")
+    monkeypatch.setattr(mesh, "CONNECTION", "/dev/ttyTEST")
     monkeypatch.setattr(mesh, "_create_serial_interface", fake_create)
     monkeypatch.setattr(mesh.threading, "Event", DummyStopEvent)
     monkeypatch.setattr(mesh.signal, "signal", lambda *_, **__: None)
@@ -1773,7 +1828,9 @@ def test_main_recreates_interface_after_snapshot_error(mesh_module, monkeypatch)
     def record_upsert(node_id, node):
         upsert_calls.append(node_id)
 
-    monkeypatch.setattr(mesh, "PORT", "/dev/ttyTEST")
+    monkeypatch.setattr(mesh, "INSTANCES", (("http://test", ""),))
+    monkeypatch.setattr(mesh, "INSTANCE", "http://test")
+    monkeypatch.setattr(mesh, "CONNECTION", "/dev/ttyTEST")
     monkeypatch.setattr(mesh, "_create_serial_interface", fake_create)
     monkeypatch.setattr(mesh, "upsert_node", record_upsert)
     monkeypatch.setattr(mesh.threading, "Event", DummyEvent)
@@ -1795,7 +1852,9 @@ def test_main_exits_when_defaults_unavailable(mesh_module, monkeypatch):
     def fail_default():
         raise mesh.NoAvailableMeshInterface("no interface available")
 
-    monkeypatch.setattr(mesh, "PORT", None)
+    monkeypatch.setattr(mesh, "INSTANCES", (("http://test", ""),))
+    monkeypatch.setattr(mesh, "INSTANCE", "http://test")
+    monkeypatch.setattr(mesh, "CONNECTION", None)
     monkeypatch.setattr(mesh, "_create_default_interface", fail_default)
     monkeypatch.setattr(mesh.signal, "signal", lambda *_, **__: None)
 
@@ -2718,7 +2777,8 @@ def test_traceroute_packet_without_identifiers_is_ignored(mesh_module, monkeypat
     assert captured == []
 
 
-def test_post_queue_prioritises_messages(mesh_module, monkeypatch):
+def test_post_queue_prioritises_nodes_over_messages(mesh_module, monkeypatch):
+    """Nodes (priority 20) must be processed before messages (priority 30)."""
     mesh = mesh_module
     mesh._clear_post_queue()
     calls = []
@@ -2735,7 +2795,7 @@ def test_post_queue_prioritises_messages(mesh_module, monkeypatch):
 
     mesh._drain_post_queue()
 
-    assert [path for path, _ in calls] == ["/api/messages", "/api/nodes"]
+    assert [path for path, _ in calls] == ["/api/nodes", "/api/messages"]
 
 
 def test_drain_post_queue_handles_enqueued_items_during_send(mesh_module):
@@ -3203,7 +3263,7 @@ def test_queue_ingestor_heartbeat_enqueues_and_throttles(mesh_module, monkeypatc
 
 
 def test_queue_ingestor_heartbeat_protocol_meshcore(mesh_module, monkeypatch):
-    """Heartbeat payload must carry the configured PROVIDER as its protocol."""
+    """Heartbeat payload must carry the configured PROTOCOL as its protocol."""
     mesh = mesh_module
     captured = []
 
@@ -3215,7 +3275,7 @@ def test_queue_ingestor_heartbeat_protocol_meshcore(mesh_module, monkeypatch):
 
     mesh.ingestors.STATE.last_heartbeat = None
     mesh.ingestors.STATE.node_id = None
-    mesh.config.PROVIDER = "meshcore"
+    mesh.config.PROTOCOL = "meshcore"
 
     mesh.ingestors.set_ingestor_node_id("!aabbccdd")
     mesh.ingestors.queue_ingestor_heartbeat(force=True)

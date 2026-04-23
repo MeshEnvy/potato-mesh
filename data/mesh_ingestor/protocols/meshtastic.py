@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Meshtastic provider implementation."""
+"""Meshtastic protocol implementation."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from pubsub import pub
 
 from .. import config, daemon as _daemon, handlers, interfaces
 from ..connection import list_serial_candidates
-from ..provider import ConnectionCandidate
+from ..mesh_protocol import ConnectionCandidate
 from ..utils import _retry_dict_snapshot
 
 _MESHTASTIC_BLE_SERVICE_UUID = "6ba1b218-15a8-461f-9fa8-5dcae273eafd"
@@ -88,7 +88,7 @@ def _meshtastic_ble_candidates(
 
 
 class MeshtasticProvider:
-    """Meshtastic ingestion provider (current default)."""
+    """Meshtastic ingestion protocol (current default)."""
 
     name = "meshtastic"
 

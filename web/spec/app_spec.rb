@@ -496,6 +496,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
     ENV.delete("PRIVATE")
     allow(Time).to receive(:now).and_return(reference_time)
     clear_database
+    PotatoMesh::App::ApiCache.invalidate_all
   end
 
   after do
@@ -1311,6 +1312,13 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(last_response.body).to include('class="footer-content"')
     end
 
+    it "renders the site title as a link to the dashboard" do
+      get "/"
+
+      expect(last_response.body).to include('class="site-title__link"')
+      expect(last_response.body).to match(%r{<a href="/" class="site-title__link">})
+    end
+
     it "renders the federation instance selector when federation is enabled" do
       get "/"
 
@@ -1351,13 +1359,12 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(last_response.body).to include('<meta name="twitter:image" content="http://example.org/potatomesh-logo.svg" />')
     end
 
-    it "disables the auto-fit toggle when a map zoom override is configured" do
+    it "does not include the removed auto-fit checkbox regardless of map zoom override" do
       allow(PotatoMesh::Config).to receive(:map_zoom).and_return(11.0)
 
       get "/"
 
-      expect(last_response.body).to include('id="fitBounds" disabled="disabled"')
-      expect(last_response.body).not_to include('id="fitBounds" checked="checked"')
+      expect(last_response.body).not_to include('id="fitBounds"')
     end
   end
 
@@ -1369,20 +1376,11 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(last_response.body).to include('class="map-panel map-panel--full"')
       expect(last_response.body).to include('id="map"')
       expect(last_response.body).to include('id="filterInput"')
-      expect(last_response.body).to include('id="autoRefresh"')
+      expect(last_response.body).not_to include('id="autoRefresh"')
       expect(last_response.body).to include('id="refreshBtn"')
       expect(last_response.body).to include('id="status"')
-      expect(last_response.body).to include('id="fitBounds"')
+      expect(last_response.body).not_to include('id="fitBounds"')
       expect(last_response.body).not_to include('<footer class="app-footer">')
-    end
-
-    it "disables the auto-fit toggle when a map zoom override is configured" do
-      allow(PotatoMesh::Config).to receive(:map_zoom).and_return(9.5)
-
-      get "/map"
-
-      expect(last_response.body).to include('id="fitBounds" disabled="disabled"')
-      expect(last_response.body).not_to include('id="fitBounds" checked="checked"')
     end
   end
 
@@ -1401,11 +1399,11 @@ RSpec.describe "Potato Mesh Sinatra app" do
       get "/federation"
 
       expect(last_response).to be_ok
-      expect(last_response.body).to include('class="federation-page federation-page--full-width"')
+      expect(last_response.body).to include('class="federation-page"')
       expect(last_response.body).to include("initializeFederationPage")
     end
 
-    it "hides dashboard-only refresh controls while keeping manual refresh and theme toggle" do
+    it "hides the meta-controls row entirely on the federation page" do
       allow(PotatoMesh::Config).to receive(:federation_enabled?).and_return(true)
 
       get "/federation"
@@ -1413,8 +1411,18 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(last_response).to be_ok
       expect(last_response.body).not_to include('id="autoRefresh"')
       expect(last_response.body).not_to include('id="filterInput"')
-      expect(last_response.body).to include('id="refreshBtn"')
-      expect(last_response.body).to include('id="themeToggle"')
+      expect(last_response.body).not_to include('id="refreshBtn"')
+      expect(last_response.body).not_to include('id="themeToggle"')
+      expect(last_response.body).not_to include('id="metaRow"')
+    end
+
+    it "renders the slim footer on the federation page" do
+      allow(PotatoMesh::Config).to receive(:federation_enabled?).and_return(true)
+
+      get "/federation"
+
+      expect(last_response).to be_ok
+      expect(last_response.body).to include('class="app-footer app-footer--slim"')
     end
   end
 
@@ -1425,7 +1433,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(last_response).to be_ok
       expect(last_response.body).to include('class="chat-panel chat-panel--full"')
       expect(last_response.body).to include('id="filterInput"')
-      expect(last_response.body).to include('id="autoRefresh"')
+      expect(last_response.body).not_to include('id="autoRefresh"')
       expect(last_response.body).to include('id="refreshBtn"')
       expect(last_response.body).to include('id="status"')
       expect(last_response.body).not_to include('<footer class="app-footer">')
@@ -1449,10 +1457,22 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(last_response.body).to include('class="nodes-table-wrapper"')
       expect(last_response.body).to include('id="nodes"')
       expect(last_response.body).to include('id="filterInput"')
-      expect(last_response.body).to include('id="autoRefresh"')
+      expect(last_response.body).not_to include('id="autoRefresh"')
       expect(last_response.body).to include('id="refreshBtn"')
       expect(last_response.body).to include('id="status"')
       expect(last_response.body).not_to include('<footer class="app-footer">')
+    end
+  end
+
+  describe "GET /charts" do
+    it "renders the charts page with the slim footer but without meta-controls" do
+      get "/charts"
+
+      expect(last_response).to be_ok
+      expect(last_response.body).to include("initializeChartsPage")
+      expect(last_response.body).not_to include('id="metaRow"')
+      expect(last_response.body).not_to include('id="filterInput"')
+      expect(last_response.body).to include('class="app-footer app-footer--slim"')
     end
   end
 
@@ -1598,13 +1618,15 @@ RSpec.describe "Potato Mesh Sinatra app" do
       end
     end
 
-    before do
+    # Stub fetch_instance_json on both the instance and class to return the
+    # supplied nodes array for /api/nodes requests.
+    def stub_remote_nodes(nodes)
       fetch_stub = lambda do |host, path|
         case path
         when "/.well-known/potato-mesh"
           [well_known_document, URI("https://#{host}#{path}")]
         when "/api/nodes"
-          [remote_nodes, URI("https://#{host}#{path}")]
+          [nodes, URI("https://#{host}#{path}")]
         else
           [nil, []]
         end
@@ -1617,6 +1639,10 @@ RSpec.describe "Potato Mesh Sinatra app" do
       allow(PotatoMesh::Application).to receive(:fetch_instance_json) do |host, path|
         fetch_stub.call(host, path)
       end
+    end
+
+    before do
+      stub_remote_nodes(remote_nodes)
 
       allow_any_instance_of(Sinatra::Application).to receive(:enqueue_federation_crawl) do |instance, domain, per_response_limit:, overall_limit:|
         db = instance.open_database
@@ -1652,6 +1678,149 @@ RSpec.describe "Potato Mesh Sinatra app" do
         expect(row["pubkey"]).to eq(pubkey)
         expect(row["signature"]).to eq(instance_signature)
         expect(row["is_private"]).to eq(0)
+      end
+    end
+
+    it "recomputes node counts from remote nodes including per-protocol breakdown" do
+      now = Time.now.to_i
+      nodes_with_protocols = [
+        { "node_id" => "mc-1", "lastHeard" => now - 10, "protocol" => "meshcore" },
+        { "node_id" => "mc-2", "lastHeard" => now - 20, "protocol" => "meshcore" },
+        { "node_id" => "mt-1", "lastHeard" => now - 30, "protocol" => "meshtastic" },
+        { "node_id" => "mt-2", "lastHeard" => now - 40, "protocol" => "meshtastic" },
+        { "node_id" => "mt-3", "lastHeard" => now - 50, "protocol" => "meshtastic" },
+      ] + Array.new([PotatoMesh::Config.remote_instance_min_node_count - 5, 0].max) { |i|
+        { "node_id" => "pad-#{i}", "lastHeard" => now - (60 + i), "protocol" => "meshtastic" }
+      }
+
+      stub_remote_nodes(nodes_with_protocols)
+
+      post "/api/instances", instance_payload.to_json, { "CONTENT_TYPE" => "application/json" }
+
+      expect(last_response.status).to eq(201)
+
+      with_db(readonly: true) do |db|
+        row = db.get_first_row(
+          "SELECT nodes_count, meshcore_nodes_count, meshtastic_nodes_count FROM instances WHERE id = ?",
+          instance_attributes[:id],
+        )
+
+        expect(row[0]).to eq(nodes_with_protocols.length)
+        expect(row[1]).to eq(2)
+        expect(row[2]).to eq(nodes_with_protocols.length - 2)
+      end
+    end
+
+    it "excludes nodes with lastHeard older than remote_instance_max_node_age" do
+      now = Time.now.to_i
+      max_age = PotatoMesh::Config.remote_instance_max_node_age
+      mixed_nodes = [
+        { "node_id" => "fresh-1", "lastHeard" => now - 10 },
+        { "node_id" => "fresh-2", "lastHeard" => now - 100 },
+        { "node_id" => "stale-1", "lastHeard" => now - max_age - 1 },
+        { "node_id" => "stale-2", "lastHeard" => now - max_age - 3600 },
+      ] + Array.new([PotatoMesh::Config.remote_instance_min_node_count - 4, 0].max) { |i|
+        { "node_id" => "pad-#{i}", "lastHeard" => now - (200 + i) }
+      }
+
+      stub_remote_nodes(mixed_nodes)
+
+      post "/api/instances", instance_payload.to_json, { "CONTENT_TYPE" => "application/json" }
+
+      expect(last_response.status).to eq(201)
+
+      with_db(readonly: true) do |db|
+        stored = db.get_first_value(
+          "SELECT nodes_count FROM instances WHERE id = ?",
+          instance_attributes[:id],
+        )
+
+        fresh_count = mixed_nodes.count { |n| n["lastHeard"] >= now - max_age }
+        expect(stored).to eq(fresh_count)
+      end
+    end
+
+    it "excludes nodes without a lastHeard timestamp" do
+      now = Time.now.to_i
+      nodes_with_gaps = [
+        { "node_id" => "has-ts", "lastHeard" => now - 10 },
+        { "node_id" => "no-ts" },
+        { "node_id" => "null-ts", "lastHeard" => nil },
+      ] + Array.new([PotatoMesh::Config.remote_instance_min_node_count - 3, 0].max) { |i|
+        { "node_id" => "pad-#{i}", "lastHeard" => now - (20 + i) }
+      }
+
+      stub_remote_nodes(nodes_with_gaps)
+
+      post "/api/instances", instance_payload.to_json, { "CONTENT_TYPE" => "application/json" }
+
+      expect(last_response.status).to eq(201)
+
+      with_db(readonly: true) do |db|
+        stored = db.get_first_value(
+          "SELECT nodes_count FROM instances WHERE id = ?",
+          instance_attributes[:id],
+        )
+
+        expected = nodes_with_gaps.count { |n|
+          ts = n["lastHeard"]
+          ts.is_a?(Integer) && ts >= Time.now.to_i - PotatoMesh::Config.remote_instance_max_node_age
+        }
+        expect(stored).to eq(expected)
+      end
+    end
+
+    it "honors the last_heard snake_case key fallback" do
+      now = Time.now.to_i
+      snake_case_nodes = Array.new(PotatoMesh::Config.remote_instance_min_node_count) do |i|
+        { "node_id" => "sc-#{i}", "last_heard" => now - i }
+      end
+
+      stub_remote_nodes(snake_case_nodes)
+
+      post "/api/instances", instance_payload.to_json, { "CONTENT_TYPE" => "application/json" }
+
+      expect(last_response.status).to eq(201)
+
+      with_db(readonly: true) do |db|
+        stored = db.get_first_value(
+          "SELECT nodes_count FROM instances WHERE id = ?",
+          instance_attributes[:id],
+        )
+
+        expect(stored).to eq(snake_case_nodes.length)
+      end
+    end
+
+    it "skips non-Hash entries in the remote nodes array" do
+      now = Time.now.to_i
+      mixed_entries = [
+        { "node_id" => "valid", "lastHeard" => now - 10 },
+        "not-a-hash",
+        42,
+        nil,
+      ] + Array.new([PotatoMesh::Config.remote_instance_min_node_count - 4, 0].max) { |i|
+        { "node_id" => "pad-#{i}", "lastHeard" => now - (20 + i) }
+      }
+
+      stub_remote_nodes(mixed_entries)
+
+      post "/api/instances", instance_payload.to_json, { "CONTENT_TYPE" => "application/json" }
+
+      expect(last_response.status).to eq(201)
+
+      with_db(readonly: true) do |db|
+        stored = db.get_first_value(
+          "SELECT nodes_count FROM instances WHERE id = ?",
+          instance_attributes[:id],
+        )
+
+        hash_count = mixed_entries.count { |n|
+          next false unless n.is_a?(Hash)
+          ts = n["lastHeard"]
+          ts.is_a?(Integer) && ts >= Time.now.to_i - PotatoMesh::Config.remote_instance_max_node_age
+        }
+        expect(stored).to eq(hash_count)
       end
     end
 
@@ -2923,6 +3092,72 @@ RSpec.describe "Potato Mesh Sinatra app" do
         expect(last_heard).to eq(expected_last_heard(node))
       end
     end
+
+    describe "generic fallback long name protection" do
+      # node_id !deadbeef → short_id BEEF; generic names are "<Label> BEEF"
+      let(:node_id) { "!deadbeef" }
+
+      def seed_node(long_name: nil)
+        with_db do |db|
+          if long_name
+            db.execute(
+              "INSERT INTO nodes(node_id, long_name, last_heard) VALUES (?,?,?)",
+              [node_id, long_name, reference_time.to_i - 3600],
+            )
+          else
+            db.execute(
+              "INSERT INTO nodes(node_id, last_heard) VALUES (?,?)",
+              [node_id, reference_time.to_i - 3600],
+            )
+          end
+        end
+      end
+
+      def post_long_name(long_name, ingestor: nil)
+        payload = { node_id => { "user" => { "longName" => long_name }, "lastHeard" => reference_time.to_i } }
+        payload["ingestor"] = ingestor if ingestor
+        post "/api/nodes", payload.to_json, auth_headers
+      end
+
+      def stored_long_name
+        with_db(readonly: true) do |db|
+          return db.get_first_value("SELECT long_name FROM nodes WHERE node_id = ?", [node_id])
+        end
+      end
+
+      it "does not overwrite a real name with a meshtastic generic fallback" do
+        seed_node(long_name: "Peter's Node")
+        post_long_name("Meshtastic BEEF")
+        expect(last_response).to be_ok
+        expect(stored_long_name).to eq("Peter's Node")
+      end
+
+      it "writes a generic fallback when no name is on record" do
+        seed_node
+        post_long_name("Meshtastic BEEF")
+        expect(last_response).to be_ok
+        expect(stored_long_name).to eq("Meshtastic BEEF")
+      end
+
+      it "overwrites a generic fallback with a real name" do
+        seed_node(long_name: "Meshtastic BEEF")
+        post_long_name("Peter's Node")
+        expect(last_response).to be_ok
+        expect(stored_long_name).to eq("Peter's Node")
+      end
+
+      it "does not overwrite a real name with a meshcore generic fallback" do
+        ingestor_id = "!aabbccdd"
+        post "/api/ingestors",
+             { node_id: ingestor_id, start_time: reference_time.to_i - 60,
+               last_seen_time: reference_time.to_i, version: "1.0.0", protocol: "meshcore" }.to_json,
+             auth_headers
+        seed_node(long_name: "Peter's Node")
+        post_long_name("Meshcore BEEF", ingestor: ingestor_id)
+        expect(last_response).to be_ok
+        expect(stored_long_name).to eq("Peter's Node")
+      end
+    end
   end
 
   describe "#ensure_unknown_node" do
@@ -2936,7 +3171,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
         db.results_as_hash = true
         row = db.get_first_row(
           <<~SQL,
-          SELECT short_name, long_name, role, last_heard, first_heard
+          SELECT short_name, long_name, role, protocol, last_heard, first_heard
           FROM nodes
           WHERE node_id = ?
         SQL
@@ -2946,8 +3181,78 @@ RSpec.describe "Potato Mesh Sinatra app" do
         expect(row["short_name"]).to eq("ABCD")
         expect(row["long_name"]).to eq("Meshtastic ABCD")
         expect(row["role"]).to eq("CLIENT_HIDDEN")
+        expect(row["protocol"]).to eq("meshtastic")
         expect(row["last_heard"]).to eq(reference_time.to_i)
         expect(row["first_heard"]).to eq(reference_time.to_i)
+      end
+    end
+
+    it "stores meshcore protocol and COMPANION role for meshcore nodes" do
+      with_db do |db|
+        created = ensure_unknown_node(db, "!abcd1234", nil, heard_time: reference_time.to_i, protocol: "meshcore")
+        expect(created).to be_truthy
+      end
+
+      with_db(readonly: true) do |db|
+        db.results_as_hash = true
+        row = db.get_first_row(
+          <<~SQL,
+          SELECT short_name, long_name, role, protocol
+          FROM nodes
+          WHERE node_id = ?
+        SQL
+          ["!abcd1234"],
+        )
+
+        expect(row["short_name"]).to eq("1234")
+        expect(row["long_name"]).to eq("Meshcore 1234")
+        expect(row["role"]).to eq("COMPANION")
+        expect(row["protocol"]).to eq("meshcore")
+      end
+    end
+
+    it "defaults to meshtastic protocol and CLIENT_HIDDEN role" do
+      with_db do |db|
+        created = ensure_unknown_node(db, "!beef0000", nil)
+        expect(created).to be_truthy
+      end
+
+      with_db(readonly: true) do |db|
+        db.results_as_hash = true
+        row = db.get_first_row(
+          <<~SQL,
+          SELECT role, protocol
+          FROM nodes
+          WHERE node_id = ?
+        SQL
+          ["!beef0000"],
+        )
+
+        expect(row["role"]).to eq("CLIENT_HIDDEN")
+        expect(row["protocol"]).to eq("meshtastic")
+      end
+    end
+
+    it "falls back to CLIENT_HIDDEN for an unknown protocol" do
+      with_db do |db|
+        created = ensure_unknown_node(db, "!cafe9999", nil, protocol: "reticulum")
+        expect(created).to be_truthy
+      end
+
+      with_db(readonly: true) do |db|
+        db.results_as_hash = true
+        row = db.get_first_row(
+          <<~SQL,
+          SELECT role, protocol, long_name
+          FROM nodes
+          WHERE node_id = ?
+        SQL
+          ["!cafe9999"],
+        )
+
+        expect(row["role"]).to eq("CLIENT_HIDDEN")
+        expect(row["protocol"]).to eq("reticulum")
+        expect(row["long_name"]).to eq("Reticulum 9999")
       end
     end
 
@@ -5824,14 +6129,15 @@ RSpec.describe "Potato Mesh Sinatra app" do
   end
 
   describe "GET /api/stats" do
-    it "returns exact SQL-backed activity counts without list-endpoint sampling" do
+    it "returns exact SQL-backed activity counts with per-protocol breakdowns" do
       clear_database
       now = reference_time.to_i
       allow(Time).to receive(:now).and_return(reference_time)
 
       with_db do |db|
         db.transaction
-        1005.times do |index|
+        # 1000 meshtastic nodes heard within the hour (protocol defaults to meshtastic)
+        1000.times do |index|
           heard = now - (index % 1800)
           node_id = format("!%08x", index + 1)
           db.execute(
@@ -5839,10 +6145,21 @@ RSpec.describe "Potato Mesh Sinatra app" do
             [node_id, index + 1, "n#{index}", "Node #{index}", "TBEAM", "CLIENT", heard, heard],
           )
         end
+        # 5 meshcore nodes heard within the hour
+        5.times do |index|
+          heard = now - (index % 1800)
+          node_id = format("!mc%06x", index + 1)
+          db.execute(
+            "INSERT INTO nodes(node_id, num, short_name, long_name, hw_model, role, last_heard, first_heard, protocol) VALUES(?,?,?,?,?,?,?,?,?)",
+            [node_id, 100_001 + index, "mc#{index}", "MC Node #{index}", "TBEAM", "CLIENT", heard, heard, "meshcore"],
+          )
+        end
+        # 1 meshtastic node heard 2 days ago (week window only)
         db.execute(
           INSERT_NODE_WITH_METADATA_SQL,
           ["!week0001", 200_001, "week", "Week Node", "TBEAM", "CLIENT", now - (2 * 86_400), now - (2 * 86_400)],
         )
+        # 1 meshtastic node heard 20 days ago (month window only)
         db.execute(
           INSERT_NODE_WITH_METADATA_SQL,
           ["!month001", 200_002, "month", "Month Node", "TBEAM", "CLIENT", now - (20 * 86_400), now - (20 * 86_400)],
@@ -5860,6 +6177,18 @@ RSpec.describe "Potato Mesh Sinatra app" do
         "day" => 1005,
         "week" => 1006,
         "month" => 1007,
+      )
+      expect(payload["meshcore"]).to include(
+        "hour" => 5,
+        "day" => 5,
+        "week" => 5,
+        "month" => 5,
+      )
+      expect(payload["meshtastic"]).to include(
+        "hour" => 1000,
+        "day" => 1000,
+        "week" => 1001,
+        "month" => 1002,
       )
     end
   end
@@ -6900,6 +7229,14 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(last_response).to be_ok
       expect(last_response.body).to include("data-node-reference=")
       expect(last_response.body).to include(node["node_id"])
+    end
+
+    it "does not render the meta row on the node detail page" do
+      node = nodes_fixture.first
+      get "/nodes/#{node["node_id"]}"
+      expect(last_response).to be_ok
+      expect(last_response.body).not_to include('id="metaRow"')
+      expect(last_response.body).not_to include('id="refreshBtn"')
     end
 
     it "returns 404 when the node cannot be located" do

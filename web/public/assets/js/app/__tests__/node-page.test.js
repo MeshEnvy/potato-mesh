@@ -360,7 +360,7 @@ test('renderSingleNodeTable renders a condensed table for the node', () => {
     10_000,
   );
   assert.equal(html.includes('<table'), true);
-  assert.ok(html.includes('meshtastic.svg'), 'default protocol should show meshtastic icon in long name link');
+  assert.ok(!html.includes('meshtastic.svg'), 'absent protocol should show no meshtastic icon in long name link');
   assert.match(html, /<a class="node-long-link" href="\/nodes\/!abcd" data-node-detail-link="true" data-node-id="!abcd">.*Example Node<\/a>/s);
   assert.equal(html.includes('66.0%'), true);
   assert.equal(html.includes('1.230%'), true);
@@ -604,7 +604,7 @@ test('renderNodeDetailHtml composes the table, neighbors, and messages', () => {
   assert.equal(html.includes('Heard by'), true);
   assert.equal(html.includes('We hear'), true);
   assert.equal(html.includes('Messages'), true);
-  assert.ok(html.includes('meshtastic.svg'), 'default protocol should show meshtastic icon in heading and table');
+  assert.ok(!html.includes('meshtastic.svg'), 'absent protocol should show no meshtastic icon in heading and table');
   assert.match(html, /<a class="node-long-link" href="\/nodes\/!abcd" data-node-detail-link="true" data-node-id="!abcd">.*Example Node<\/a>/s);
   assert.equal(html.includes('PEER'), true);
   assert.equal(html.includes('ALLY'), true);
@@ -665,7 +665,7 @@ test('renderSingleNodeTable shows meshtastic icon for meshtastic protocol in lon
   assert.ok(html.includes('meshtastic.svg'), 'meshtastic protocol should show icon in long name link');
 });
 
-test('renderSingleNodeTable shows meshtastic icon when protocol is absent in long name link', () => {
+test('renderSingleNodeTable shows no protocol icon when protocol is absent in long name link', () => {
   const node = {
     shortName: 'A',
     longName: 'Alice',
@@ -674,7 +674,8 @@ test('renderSingleNodeTable shows meshtastic icon when protocol is absent in lon
     rawSources: { node: { node_id: '!aa', role: 'CLIENT' } },
   };
   const html = renderSingleNodeTable(node, (short, role) => `<span data-role="${role}">${short}</span>`, 0);
-  assert.ok(html.includes('meshtastic.svg'), 'absent protocol should show meshtastic icon in long name link');
+  assert.ok(!html.includes('meshtastic.svg'), 'absent protocol should show no meshtastic icon in long name link');
+  assert.ok(!html.includes('meshcore.svg'), 'absent protocol should show no meshcore icon in long name link');
 });
 
 test('renderSingleNodeTable omits meshtastic icon for meshcore protocol in long name link', () => {
@@ -700,12 +701,13 @@ test('renderNodeDetailHtml shows meshtastic icon in heading for meshtastic proto
   assert.ok(html.includes('meshtastic.svg'), 'meshtastic protocol should show icon in heading');
 });
 
-test('renderNodeDetailHtml shows meshtastic icon in heading when protocol is absent', () => {
+test('renderNodeDetailHtml shows no protocol icon in heading when protocol is absent', () => {
   const html = renderNodeDetailHtml(
     { shortName: 'A', longName: 'Alice', nodeId: '!aa', role: 'CLIENT' },
     { renderShortHtml: short => `<span>${short}</span>` },
   );
-  assert.ok(html.includes('meshtastic.svg'), 'absent protocol should show meshtastic icon in heading');
+  assert.ok(!html.includes('meshtastic.svg'), 'absent protocol should show no meshtastic icon in heading');
+  assert.ok(!html.includes('meshcore.svg'), 'absent protocol should show no meshcore icon in heading');
 });
 
 test('renderNodeDetailHtml omits meshtastic icon in heading for meshcore protocol', () => {
@@ -736,7 +738,7 @@ test('renderMessages prefixes meshtastic icon for meshtastic node protocol', () 
   assert.ok(html.includes('meshtastic.svg'), 'meshtastic node chat entry should show icon');
 });
 
-test('renderMessages prefixes meshtastic icon when node protocol is absent', () => {
+test('renderMessages shows no protocol icon when node protocol is absent', () => {
   const nodeContext = {
     shortName: 'SRC',
     longName: 'Source',
@@ -750,7 +752,70 @@ test('renderMessages prefixes meshtastic icon when node protocol is absent', () 
     (short, role) => `<span data-role="${role}">${short}</span>`,
     nodeContext,
   );
-  assert.ok(html.includes('meshtastic.svg'), 'absent node protocol chat entry should show meshtastic icon');
+  assert.ok(!html.includes('meshtastic.svg'), 'absent node protocol chat entry should show no meshtastic icon');
+  assert.ok(!html.includes('meshcore.svg'), 'absent node protocol chat entry should show no meshcore icon');
+});
+
+test('renderMessages: channel name fallback uses message.channel_label when metadata is empty (#727 coverage)', () => {
+  // Exercises the ``fallbackChannel`` branch in renderMessages: when
+  // extractChatMessageMetadata does not return a channelName (because the
+  // message has neither ``channel_name`` nor ``channelName``) but does
+  // carry a legacy ``channel_label`` field, that string is promoted into
+  // the metadata object so the channel tag still renders.
+  const renderShortHtml = (short) => `<span class="short-name">${short}</span>`;
+  const html = renderMessages(
+    [{ text: 'hi', rx_time: 1_700_000_000, channel_label: 'legacy-label' }],
+    renderShortHtml,
+    { node_id: '!self', short_name: 'NODE', long_name: 'Node', role: 'CLIENT' },
+  );
+  assert.ok(html.includes('[legacy-label]'), 'channel_label fallback should appear in tag');
+});
+
+test('renderMessages: channel name fallback uses numeric message.channel when no string label exists (#727 coverage)', () => {
+  // Exercises the ``numberOrNull(message.channel)`` branch: a numeric
+  // channel index without an associated channel_name is stringified into
+  // the channel tag.
+  const renderShortHtml = (short) => `<span class="short-name">${short}</span>`;
+  const html = renderMessages(
+    [{ text: 'hi', rx_time: 1_700_000_000, channel: 7 }],
+    renderShortHtml,
+    { node_id: '!self', short_name: 'NODE', long_name: 'Node', role: 'CLIENT' },
+  );
+  assert.ok(html.includes('[7]'), 'numeric channel fallback should appear in tag');
+});
+
+test('renderMessages: channel name fallback uses string message.channel when neither label nor number is present (#727 coverage)', () => {
+  // Exercises the final ``stringOrNull(message.channel)`` branch.  This
+  // covers the path where ``channel`` is a non-numeric string label that
+  // ``numberOrNull`` rejects but ``stringOrNull`` accepts.
+  const renderShortHtml = (short) => `<span class="short-name">${short}</span>`;
+  const html = renderMessages(
+    [{ text: 'hi', rx_time: 1_700_000_000, channel: 'alpha' }],
+    renderShortHtml,
+    { node_id: '!self', short_name: 'NODE', long_name: 'Node', role: 'CLIENT' },
+  );
+  assert.ok(html.includes('[alpha]'), 'string channel fallback should appear in tag');
+});
+
+test('renderMessages: skips invalid entries in the global node registry (#727 coverage)', () => {
+  // Covers the ``if (id && node && typeof node === 'object')`` guard inside
+  // buildNodesById.  Bad entries (null values, non-id keys) must be ignored
+  // without breaking the registry build.
+  const renderShortHtml = (short) => `<span class="short-name">${short}</span>`;
+  const globalNodesById = new Map([
+    ['', { node_id: '', short_name: 'EMPTY' }],   // empty-id entry — skipped
+    ['!ok', { node_id: '!ok', short_name: 'OK', long_name: 'OK Node' }],
+    ['!bad', null],                                // null value — skipped
+  ]);
+  const html = renderMessages(
+    [{ text: '@[OK Node] hi', rx_time: 1_700_000_000, protocol: 'meshcore', to_id: '^all' }],
+    renderShortHtml,
+    { node_id: '!self', short_name: 'NODE', long_name: 'Node', role: 'CLIENT' },
+    globalNodesById,
+  );
+  // The mention should resolve via the surviving entry, demonstrating the
+  // registry build skipped the bad ones without throwing.
+  assert.ok(html.includes('OK'), 'valid registry entry should still resolve mention');
 });
 
 test('renderMessages omits meshtastic icon for meshcore node protocol', () => {
@@ -916,7 +981,7 @@ test('fetchMessages handles HTTP responses and uses defaults', async () => {
   };
   const messages = await fetchMessages('!node', { fetchImpl });
   assert.equal(messages.length, 1);
-  assert.equal(calls[0].options.cache, 'no-store');
+  assert.equal(calls[0].options.cache, 'default');
 });
 
 test('fetchMessages returns an empty list when the endpoint is missing', async () => {
@@ -999,7 +1064,7 @@ test('fetchTracesForNode requests traceroutes for the node', async () => {
   const traces = await fetchTracesForNode('!abc', { fetchImpl });
   assert.equal(traces.length, 1);
   assert.equal(calls[0].url.includes('/api/traces/!abc'), true);
-  assert.equal(calls[0].options.cache, 'no-store');
+  assert.equal(calls[0].options.cache, 'default');
 });
 
 test('fetchTracesForNode returns empty when identifier is missing', async () => {
