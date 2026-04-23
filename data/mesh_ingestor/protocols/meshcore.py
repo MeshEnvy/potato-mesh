@@ -87,6 +87,7 @@ _meshcore_patches.apply()
 
 from .. import config, ingestors as _ingestors, queue as _queue
 from ..connection import default_serial_targets, parse_ble_target, parse_tcp_target
+from ..mesh_protocol import ConnectionCandidate
 from ..serialization import _iso, _node_num_from_id
 
 # ---------------------------------------------------------------------------
@@ -103,7 +104,6 @@ class ClosedBeforeConnectedError(ConnectionError):
     user-initiated shutdown from a hardware failure can catch this type
     specifically.
     """
-
 
 # ---------------------------------------------------------------------------
 # Debug log file
@@ -1143,6 +1143,13 @@ async def _run_meshcore(
     stop_event = asyncio.Event()
     iface._stop_event = stop_event
 
+    # Install early so :meth:`_MeshcoreInterface.close` can signal shutdown with
+    # ``stop_event.set()`` instead of ``loop.stop()`` while ``connect()`` or the
+    # ``finally`` disconnect is still running (avoids RuntimeError from
+    # :meth:`asyncio.loop.run_until_complete`).
+    stop_event = asyncio.Event()
+    iface._stop_event = stop_event
+
     mc: MeshCore | None = None
     try:
         cx = _make_connection(target, _DEFAULT_BAUDRATE)
@@ -1231,6 +1238,75 @@ async def _run_meshcore(
                 pass
 
 
+_MESHCORE_BLE_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+"""MeshCore companion Nordic-UART-style service UUID for BLE filtering."""
+
+
+def _meshcore_ble_keep(device: object) -> bool:
+    """Return ``True`` when *device* looks like a MeshCore BLE peripheral."""
+
+    name = (getattr(device, "name", None) or "").strip()
+    if name:
+        return "meshcore" in name.casefold()
+    return True
+
+
+def _meshcore_ble_candidates(ble_scan_timeout_secs: float) -> list[ConnectionCandidate]:
+    """Return BLE devices advertising the MeshCore companion service."""
+
+    try:
+        from bleak import BleakScanner  # type: ignore[import-untyped]
+    except Exception as exc:  # pragma: no cover
+        config._debug_log(
+            "BLE scan skipped (bleak unavailable)",
+            context="meshcore.scan",
+            severity="warn",
+            error_class=exc.__class__.__name__,
+        )
+        return []
+
+    async def _discover():
+        return await BleakScanner.discover(
+            timeout=ble_scan_timeout_secs,
+            service_uuids=[_MESHCORE_BLE_SERVICE_UUID],
+        )
+
+    try:
+        devices = asyncio.run(_discover())
+    except RuntimeError as exc:
+        config._debug_log(
+            "BLE scan skipped (async runtime)",
+            context="meshcore.scan",
+            severity="warn",
+            error_message=str(exc),
+        )
+        return []
+    except Exception as exc:  # pragma: no cover
+        config._debug_log(
+            "BLE scan failed",
+            context="meshcore.scan",
+            severity="warn",
+            error_class=exc.__class__.__name__,
+            error_message=str(exc),
+        )
+        return []
+
+    by_target: dict[str, ConnectionCandidate] = {}
+    for device in devices:
+        if not _meshcore_ble_keep(device):
+            continue
+        addr = (getattr(device, "address", None) or "").strip()
+        if not addr:
+            continue
+        target = addr.upper() if ":" in addr else addr
+        name = (getattr(device, "name", None) or "").strip() or "(no name)"
+        rssi = getattr(device, "rssi", None)
+        rssi_part = f" RSSI={rssi} dBm" if rssi is not None else ""
+        label = f"{name} — {target}{rssi_part}"
+        by_target[target] = ConnectionCandidate(target=target, label=label, kind="ble")
+    return sorted(by_target.values(), key=lambda c: c.label.casefold())
+
+
 # ---------------------------------------------------------------------------
 # Provider
 # ---------------------------------------------------------------------------
@@ -1284,7 +1360,7 @@ class MeshcoreProvider:
 
         Returns:
             ``(iface, resolved_target, next_active_candidate)`` matching the
-            :class:`~data.mesh_ingestor.provider.Provider` contract.
+            :class:`~data.mesh_ingestor.mesh_protocol.MeshProtocol` contract.
 
         Raises:
             ConnectionError: When the node does not complete the handshake
@@ -1395,6 +1471,18 @@ class MeshcoreProvider:
         if self_item is not None:
             items.append(self_item)
         return items
+
+    def list_connection_candidates(
+        self, *, ble_scan_timeout_secs: float
+    ) -> list[ConnectionCandidate]:
+        """List serial ports and MeshCore-compatible BLE peripherals."""
+
+        serial_rows = [
+            ConnectionCandidate(target=path, label=path, kind="serial")
+            for path in list_serial_candidates()
+        ]
+        ble_rows = _meshcore_ble_candidates(ble_scan_timeout_secs)
+        return [*serial_rows, *ble_rows]
 
 
 __all__ = ["MeshcoreProvider"]

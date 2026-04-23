@@ -396,9 +396,10 @@ export function hexToRgba(hex, alpha = 1) {
 }
 
 /**
- * Format a timestamp as a zero-padded day-of-month string (local time zone).
+ * Format a timestamp as a zero-padded day-of-month string in UTC.
  *
- * Used as the default tick label formatter on the X axis.
+ * Used as the default tick label formatter on the X axis.  Epoch milliseconds
+ * are interpreted in UTC so labels stay stable across viewer time zones.
  *
  * @param {number} timestampMs Timestamp expressed in milliseconds.
  * @returns {string} Two-digit day string, or empty string when invalid.
@@ -406,7 +407,7 @@ export function hexToRgba(hex, alpha = 1) {
 export function formatCompactDate(timestampMs) {
   const date = new Date(timestampMs);
   if (Number.isNaN(date.getTime())) return '';
-  const day = padTwo(date.getDate());
+  const day = padTwo(date.getUTCDate());
   return day;
 }
 

@@ -24,7 +24,7 @@ import time
 
 from pubsub import pub
 
-from . import config, handlers, ingestors, interfaces, queue
+from . import config, connection_scan, handlers, ingestors, interfaces, queue
 from .mesh_protocol import MeshProtocol
 from .utils import _retry_dict_snapshot
 
@@ -651,6 +651,9 @@ def main(*, provider: MeshProtocol | None = None) -> None:
         return
 
     queue._start_queue_drainer(queue.STATE)
+
+    if connection_scan.connection_is_ask(config.CONNECTION):
+        config.CONNECTION = connection_scan.scan_connection(provider)
 
     state = _DaemonState(
         provider=provider,
